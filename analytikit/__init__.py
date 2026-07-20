@@ -6,6 +6,7 @@ from .stat_kit import (
 	compute_confidence_interval_difference,
 	plot_group_comparison,
 	plot_dependent_group_comparison,
+	make_subject_palette,
 )
 from .helpers import (
 	percent,
@@ -26,6 +27,7 @@ __all__ = [
 	"compute_confidence_interval_difference",
 	"plot_group_comparison",
 	"plot_dependent_group_comparison",
+	"make_subject_palette",
 	"percent",
 	"plus_minus",
 	"print_title",

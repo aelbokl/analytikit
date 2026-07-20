@@ -14,10 +14,12 @@ from scikit_posthocs import posthoc_dunn as dunn
 import scikit_posthocs as sp
 import copy
 import math 
+import warnings
 from statsmodels.stats.contingency_tables import mcnemar
 from statsmodels.stats.contingency_tables import cochrans_q
 from statsmodels.stats.contingency_tables import SquareTable 
 from scipy.stats import friedmanchisquare
+import colorsys
 import seaborn as sns
 import matplotlib.pyplot as plt
 from pingouin import pairwise_tests
@@ -58,6 +60,171 @@ def version():
     Returns the version of the package
     """
     return "1.1.2"
+
+
+# Explicit inference policies used by the non-parametric two-sample tests.
+# Keeping these options in one place prevents SciPy defaults from being applied
+# differently by the test and by the confidence-interval calculation.
+_MANN_WHITNEY_OPTIONS = {
+    "alternative": "two-sided",
+    "use_continuity": True,
+}
+_WILCOXON_OPTIONS = {
+    "zero_method": "wilcox",
+    "correction": False,
+    "alternative": "two-sided",
+    "method": "auto",
+}
+
+
+def _display_p_value(p_value):
+    """Round a p-value for display without changing the value used for inference."""
+    return round(float(p_value), 3)
+
+
+def _mann_whitney_method(group1, group2):
+    """Resolve SciPy's current ``method='auto'`` policy once per analysis.
+
+    The resolved method is then held fixed while the test is inverted to form
+    its confidence interval. This reproduces the p-value from SciPy's current
+    auto policy while preventing the method from changing as candidate shifts
+    create or remove cross-group ties.
+    """
+    group1_arr = np.asarray(group1)
+    group2_arr = np.asarray(group2)
+    pooled = np.concatenate((group1_arr.ravel(), group2_arr.ravel()))
+    has_ties = np.unique(pooled).size < pooled.size
+    return "exact" if min(group1_arr.size, group2_arr.size) <= 8 and not has_ties else "asymptotic"
+
+
+def _mann_whitney_test(group1, group2, method=None):
+    """Run the package's explicit two-sided Mann-Whitney test policy."""
+    if method is None:
+        method = _mann_whitney_method(group1, group2)
+    return stats.mannwhitneyu(
+        group1,
+        group2,
+        method=method,
+        **_MANN_WHITNEY_OPTIONS,
+    )
+
+
+def _wilcoxon_test(group1, group2=None):
+    """Run the package's explicit two-sided Wilcoxon signed-rank policy."""
+    return stats.wilcoxon(group1, group2, **_WILCOXON_OPTIONS)
+
+
+def _test_inverted_interval(breakpoints, p_value_at, estimate, alpha):
+    """Invert a two-sided stepwise test and return its central acceptance interval.
+
+    Rank-test p-values change only at a finite collection of breakpoints. Both
+    the breakpoints and the open regions between them are tested because ties
+    can make inclusion at an endpoint differ from inclusion immediately beside
+    it. The returned inclusivity flags allow callers to print ``(`` or ``)``
+    when a discrete endpoint itself is rejected.
+    """
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1")
+
+    points = np.unique(np.asarray(breakpoints, dtype=float))
+    points = points[np.isfinite(points)]
+    if points.size == 0:
+        raise ValueError("Cannot invert a test without finite candidate breakpoints")
+
+    number_of_points = points.size
+    last_state = 2 * number_of_points
+    span = max(float(np.ptp(points)), 1.0)
+    cache = {}
+
+    def value_for_state(state):
+        if state == 0:
+            return points[0] - span - 1.0
+        if state == last_state:
+            return points[-1] + span + 1.0
+        if state % 2 == 1:
+            return points[(state - 1) // 2]
+        right = state // 2
+        return points[right - 1] + (points[right] - points[right - 1]) / 2
+
+    def is_accepted(state):
+        if state not in cache:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                p_value = float(p_value_at(value_for_state(state)))
+            cache[state] = np.isfinite(p_value) and p_value >= alpha
+        return cache[state]
+
+    insertion = int(np.searchsorted(points, estimate))
+    if insertion < number_of_points and np.isclose(points[insertion], estimate, rtol=0, atol=0):
+        preferred_state = 2 * insertion + 1
+    else:
+        preferred_state = 2 * insertion
+    preferred_state = min(max(preferred_state, 0), last_state)
+
+    # A full scan is exact and inexpensive for the small/tie-heavy datasets for
+    # which these intervals are most often used. For large continuous samples,
+    # locate the central accepted component with logarithmic test evaluations.
+    if last_state + 1 <= 2001:
+        accepted = np.array([is_accepted(state) for state in range(last_state + 1)])
+        accepted_states = np.flatnonzero(accepted)
+        if accepted_states.size == 0:
+            raise RuntimeError("The inverted test has no accepted parameter values")
+        centre = int(accepted_states[np.argmin(np.abs(accepted_states - preferred_state))])
+        lower_state = centre
+        while lower_state > 0 and accepted[lower_state - 1]:
+            lower_state -= 1
+        upper_state = centre
+        while upper_state < last_state and accepted[upper_state + 1]:
+            upper_state += 1
+    else:
+        nearby = range(max(0, preferred_state - 2), min(last_state, preferred_state + 2) + 1)
+        accepted_nearby = [state for state in nearby if is_accepted(state)]
+        if not accepted_nearby:
+            # This is a defensive fallback for unusual discrete samples.
+            accepted_nearby = [state for state in range(last_state + 1) if is_accepted(state)]
+            if not accepted_nearby:
+                raise RuntimeError("The inverted test has no accepted parameter values")
+        centre = min(accepted_nearby, key=lambda state: abs(state - preferred_state))
+
+        if is_accepted(0):
+            lower_state = 0
+        else:
+            rejected, accepted_state = 0, centre
+            while accepted_state - rejected > 1:
+                middle = (rejected + accepted_state) // 2
+                if is_accepted(middle):
+                    accepted_state = middle
+                else:
+                    rejected = middle
+            lower_state = accepted_state
+
+        if is_accepted(last_state):
+            upper_state = last_state
+        else:
+            accepted_state, rejected = centre, last_state
+            while rejected - accepted_state > 1:
+                middle = (accepted_state + rejected) // 2
+                if is_accepted(middle):
+                    accepted_state = middle
+                else:
+                    rejected = middle
+            upper_state = accepted_state
+
+    if lower_state == 0:
+        lower, lower_inclusive = -np.inf, False
+    elif lower_state % 2 == 1:
+        lower, lower_inclusive = points[(lower_state - 1) // 2], True
+    else:
+        lower, lower_inclusive = points[lower_state // 2 - 1], False
+
+    if upper_state == last_state:
+        upper, upper_inclusive = np.inf, False
+    elif upper_state % 2 == 1:
+        upper, upper_inclusive = points[(upper_state - 1) // 2], True
+    else:
+        upper, upper_inclusive = points[upper_state // 2], False
+
+    return (lower, upper), (lower_inclusive, upper_inclusive)
 
 # drop_columns, lookup_columns, print_missing should live in cleaning_kit
 
@@ -157,6 +324,35 @@ def calculate_ci_diff_from_series(series_list, mode, num_samples=1000, alpha=0.0
 ## cleaning-related function removed; use cleaning_kit.print_missing if needed
 
 
+def make_subject_palette(index):
+    """
+    Create a consistent color mapping for subjects keyed by their DataFrame index.
+
+    Parameters:
+    index: A pandas Index, list, or array of subject identifiers.
+
+    Returns:
+    dict mapping each subject identifier to an RGB color tuple.
+    Call this once from your DataFrame and reuse the result across all compare_ind calls
+    to ensure the same subject always receives the same color.
+
+    Example:
+        palette = sk.make_subject_palette(df.index)
+        sk.compare_ind([df.loc[g1, 'NIHSS'], df.loc[g2, 'NIHSS']], subject_palette=palette)
+    """
+    unique_ids = list(dict.fromkeys(index))  # deduplicate while preserving order
+    # Golden-ratio hue stepping: each color is ~222° away from the last on the hue
+    # wheel, preventing the circular wrap-around similarity that evenly-spaced
+    # palettes (husl, hls) suffer from at large N.
+    golden_ratio = 0.618033988749895
+    h = 0.1  # starting hue
+    colors = []
+    for _ in range(len(unique_ids)):
+        colors.append(colorsys.hsv_to_rgb(h, 0.65, 0.90))
+        h = (h + golden_ratio) % 1.0
+    return dict(zip(unique_ids, colors))
+
+
 def plot_group_comparison(
     groups,
     group_labels,
@@ -168,6 +364,7 @@ def plot_group_comparison(
     continuous=True,
     all_normal=None,
     contingency_table=None,
+    subject_palette=None,
 ):
     if not do_graphs or p_value is None:
         return
@@ -182,6 +379,7 @@ def plot_group_comparison(
                     [[label] * len(group) for label, group in zip(group_labels, groups)]
                 ),
                 "value": np.concatenate([np.asarray(group) for group in groups]),
+                "patient_id": np.concatenate([group.index for group in groups]),
             }
         )
         value_label = groups[0].name if getattr(groups[0], "name", None) else "Value"
@@ -195,7 +393,7 @@ def plot_group_comparison(
                 inner=None,
                 cut=0,
                 width=0.5,
-                color="#8FAFC1",
+                palette="pastel",
                 linewidth=1,
             )
         else:
@@ -204,21 +402,34 @@ def plot_group_comparison(
                 x="group",
                 y="value",
                 width=0.5,
-                color="#8FAFC1",
+                palette="pastel",
                 showfliers=False,
                 fliersize=3,
                 linewidth=1,
             )
 
-        sns.stripplot(
-            data=plot_df,
-            x="group",
-            y="value",
-            color="black",
-            alpha=0.5,
-            jitter=0.12,
-            size=4,
-        )
+        if subject_palette is not None:
+            sns.stripplot(
+                data=plot_df,
+                x="group",
+                y="value",
+                hue="patient_id",
+                palette=subject_palette,
+                alpha=0.7,
+                jitter=0.12,
+                size=4,
+                legend=False,
+            )
+        else:
+            sns.stripplot(
+                data=plot_df,
+                x="group",
+                y="value",
+                color="black",
+                alpha=0.5,
+                jitter=0.12,
+                size=4,
+            )
         ax.set_xlabel("Group", fontsize=12, fontweight="bold")
         ax.set_ylabel(value_label, fontsize=12, fontweight="bold")
         ax.tick_params(axis="x", labelrotation=0, labelsize=10)
@@ -280,6 +491,7 @@ def compare_ind(
     data_type=None,
     do_graphs=True,
     graphs_for_non_significance=False,
+    subject_palette=None,
 ):  # Depends on print_mean_std()
     # Note: this function does not handle the independent variable (grouping variable). It assumes that the series are already grouped.
     # groups: a list of pandas series/columns to be compared
@@ -301,6 +513,7 @@ def compare_ind(
     #ci
     ci_lower = None
     ci_upper = None
+    ci_inclusive = (True, True)
 
     tukey_results = None
     dunn_results = None
@@ -377,12 +590,11 @@ def compare_ind(
                 print_title("Test for Normality")
                 statistic, p_value = stats.shapiro(group)
                 statistic = round(statistic, 3)
-                p_value = round(p_value, 3)
                 # print group label for this group
                 print("Test for normality (Shapiro-Wilk) for", group_labels[index])
                 print("-------------------------------------------------")
                 print("Statistic:", statistic)
-                print("p-value:", p_value)
+                print("p-value:", _display_p_value(p_value))
                 if p_value > alpha:
                     print("Data is normally distributed.")
                 else:
@@ -437,10 +649,11 @@ def compare_ind(
             # Use Welch's t-test (equal_var=False) to match the CI calculation
             statistic, p_value = stats.ttest_ind(groups[0], groups[1], equal_var=False)
             statistic = round(statistic, 3)
-            p_value = round(p_value, 3)
 
             #ci difference
-            ci_lower, ci_upper=compute_confidence_interval_difference(groups[0], groups[1], method="mean", paired=False, alpha=alpha)["CI"]
+            ci_result = compute_confidence_interval_difference(groups[0], groups[1], method="mean", paired=False, alpha=alpha)
+            ci_lower, ci_upper = ci_result["CI"]
+            ci_inclusive = ci_result["CI_inclusive"]
 
             # Weighted pooled SD — correct for unequal group sizes
             n1 = len(groups[0])
@@ -466,7 +679,6 @@ def compare_ind(
             # Use one-way ANOVA to compare all group
             statistic, p_value = stats.f_oneway(*groups)
             statistic = round(statistic, 3)
-            p_value = round(p_value, 3)
 
             #MAHA# # Compute the effect size for one-way ANOVA (eta squared (η²))
             N = sum(len(group) for group in groups)  # Total sample size
@@ -503,10 +715,15 @@ def compare_ind(
             line1 = "Not all data is normally distributed."
 
             # Use Mann-Whitney U test to compare all group
-            statistic, p_value = stats.mannwhitneyu(groups[0], groups[1])
+            mann_whitney_method = _mann_whitney_method(groups[0], groups[1])
+            statistic, p_value = _mann_whitney_test(
+                groups[0], groups[1], method=mann_whitney_method
+            )
 
             #ci difference
-            ci_lower, ci_upper=compute_confidence_interval_difference(groups[0], groups[1], method="median", paired=False, alpha=alpha)["CI"]
+            ci_result = compute_confidence_interval_difference(groups[0], groups[1], method="median", paired=False, alpha=alpha)
+            ci_lower, ci_upper = ci_result["CI"]
+            ci_inclusive = ci_result["CI_inclusive"]
 
             
 
@@ -535,7 +752,6 @@ def compare_ind(
             
             # Round for display after using in calculations
             statistic = round(statistic, 3)
-            p_value = round(p_value, 3)
             
         # If all group are not normally distributed, and we have more than 2 groups, use Kruskal-Wallis H test
         elif not all_normal and len(groups) > 2:
@@ -546,7 +762,6 @@ def compare_ind(
             # Use Kruskal-Wallis H test to compare all group
             statistic, p_value = stats.kruskal(*groups)
             statistic = round(statistic, 3)
-            p_value = round(p_value, 3)
             #ci
             # ci_lower, ci_upper=calculate_ci_diff_from_series(groups, 'median')
 
@@ -631,7 +846,6 @@ def compare_ind(
 
             chi2_stat_unrounded = statistic  # Save unrounded value for effect size calculation
             statistic = round(statistic, 3)
-            p_value = round(p_value, 3)
 
             #MAHA# # Compute the effect size for Chi-squared (Cramer's V)
             n = contingency_table.sum().sum()  # Total sample size
@@ -665,7 +879,6 @@ def compare_ind(
             if is_2x2_table:
                 # Perform Fisher's exact test
                 statistic, p_value = stats.fisher_exact(contingency_table)
-                p_value = round(p_value, 3)
                 statistic = round(statistic, 3)
 
                 test_name = "Fisher's exact test"
@@ -687,7 +900,6 @@ def compare_ind(
 
                 chi2_stat_unrounded = statistic  # Save unrounded value for effect size calculation
                 statistic = round(statistic, 3)
-                p_value = round(p_value, 3)
 
                 # # Compute the effect size (Cramer's V)
                 n = contingency_table.sum().sum()  # Total sample size
@@ -736,11 +948,15 @@ def compare_ind(
     #         ci_low, ci_upp = proportion_ci(count, n)
     #         print(f"{col} proportion 95% CI: [{ci_low:.2f}, {ci_upp:.2f}]")
 
-    print("p-value:", p_value)
+    print("p-value:", _display_p_value(p_value))
     
     if ci_lower!=None and ci_upper!=None:
         confidence_level= 100-(alpha*100)
-        print(f"{confidence_level}% CI: [{ci_lower:.2f}, {ci_upper:.2f}]")
+        left_bracket = "[" if ci_inclusive[0] else "("
+        right_bracket = "]" if ci_inclusive[1] else ")"
+        print(f"{confidence_level}% CI: {left_bracket}{ci_lower:.2f}, {ci_upper:.2f}{right_bracket}")
+        if not all(ci_inclusive):
+            print("* Parentheses indicate an excluded endpoint.")
     print()
 
     #
@@ -772,6 +988,7 @@ def compare_ind(
         continuous=continuous,
         all_normal=all_normal,
         contingency_table=contingency_table,
+        subject_palette=subject_palette,
     )
           
 
@@ -872,6 +1089,7 @@ def compare_dep(
     post_hoc = {}
     ci_lower = None
     ci_upper = None
+    ci_inclusive = (True, True)
     use_median_for_plot = None
     all_normal = None
 
@@ -949,12 +1167,11 @@ def compare_dep(
                 print_title("Test for Normality")
                 statistic, p_value = stats.shapiro(group)
                 statistic = round(statistic, 3)
-                p_value = round(p_value, 3)
                 # print group label for this group
                 print("Test for normality (Shapiro-Wilk) for", group_labels[index])
                 print("-------------------------------------------------")
                 print("Statistic:", statistic)
-                print("p-value:", p_value)
+                print("p-value:", _display_p_value(p_value))
                 if p_value > alpha:
                     print("Data is normally distributed.")
                 else:
@@ -1010,10 +1227,11 @@ def compare_dep(
             # Use t-test to compare all group
             statistic, p_value = stats.ttest_rel(groups[0], groups[1])
             statistic = round(statistic, 3)
-            p_value = round(p_value, 3)
 
             #ci difference
-            ci_lower, ci_upper=compute_confidence_interval_difference(groups[0], groups[1], method="mean", paired=True, alpha=alpha)["CI"]
+            ci_result = compute_confidence_interval_difference(groups[0], groups[1], method="mean", paired=True, alpha=alpha)
+            ci_lower, ci_upper = ci_result["CI"]
+            ci_inclusive = ci_result["CI_inclusive"]
 
 # # Compute the effect size (Cohen's d)
 # n = len(groups[0])
@@ -1073,7 +1291,7 @@ def compare_dep(
             statistic, p_value = anova_results.loc[0, ["F", p_col]]
 
             # Round results
-            statistic, p_value = round(statistic, 3), round(p_value, 3)
+            statistic = round(statistic, 3)
 
             # Compute partial eta squared from F and dfs (correct formula, version-independent)
             # ηp² = (F × df1) / (F × df1 + df2)
@@ -1101,12 +1319,13 @@ def compare_dep(
             line1 = "Not all data is normally distributed."
 
             # Use Wilcoxon signed-rank test to compare all group
-            statistic_raw, p_value = stats.wilcoxon(groups[0], groups[1])
-            p_value = round(p_value, 3)
+            statistic_raw, p_value = _wilcoxon_test(groups[0], groups[1])
             statistic = round(statistic_raw, 3)
 
             #ci difference
-            ci_lower, ci_upper=compute_confidence_interval_difference(groups[0], groups[1], method="median", paired=True, alpha=alpha)["CI"]
+            ci_result = compute_confidence_interval_difference(groups[0], groups[1], method="median", paired=True, alpha=alpha)
+            ci_lower, ci_upper = ci_result["CI"]
+            ci_inclusive = ci_result["CI_inclusive"]
 
             # Compute the effect size for Wilcoxon signed-rank (r)
             # Use unrounded statistic; divide by sqrt(2n) per standard formula
@@ -1161,7 +1380,7 @@ def compare_dep(
             statistic = friedman_results['Q'].iloc[0]
             p_col = 'p_unc' if 'p_unc' in friedman_results.columns else 'p-unc'
             p_value = friedman_results[p_col].iloc[0]
-            statistic, p_value = round(statistic, 3), round(p_value, 3)
+            statistic = round(statistic, 3)
 
             # Calculate Kendall's W
             n = len(groups[0])  # number of subjects
@@ -1216,7 +1435,7 @@ def compare_dep(
             result = mcnemar(contingency_table, exact=True)  # exact=True for exact test
                                                 # exact=False for chi-square approximation
             statistic = round(result.statistic, 3)
-            p_value = round(result.pvalue, 3)
+            p_value = result.pvalue
             
             # Compute effect size (Odds Ratio)
             OR = (contingency_table.iloc[1, 0] + 1) / (contingency_table.iloc[0, 1] + 1)
@@ -1238,7 +1457,7 @@ def compare_dep(
 
             result = cochrans_q(data_wide)
             statistic = round(result.statistic, 3)
-            p_value = round(result.pvalue, 3)
+            p_value = result.pvalue
 
             
             # Compute Kendall's W as effect size
@@ -1265,7 +1484,7 @@ def compare_dep(
             result = table.homogeneity(method='stuart_maxwell')
 
             # Store results
-            p_value = round(result.pvalue, 3)
+            p_value = result.pvalue
             statistic = round(result.statistic, 3)
 
             # Compute effect size (Cohen's W approximation)
@@ -1301,7 +1520,6 @@ def compare_dep(
 
                 # Store results
                 statistic=round(statistic,3)
-                p_value=round(p_value,3)
 
             
                 # effect_size["label"] = "Kendall's W"
@@ -1348,11 +1566,15 @@ def compare_dep(
     #         print(f"{col} proportion 95% CI: [{ci_low:.2f}, {ci_upp:.2f}]")
 
 
-    print("p-value:", p_value)
+    print("p-value:", _display_p_value(p_value))
     
     if ci_lower!=None and ci_upper!=None:
         confidence_level= 100-(alpha*100)
-        print(f"{confidence_level}% CI: [{ci_lower:.2f}, {ci_upper:.2f}]")
+        left_bracket = "[" if ci_inclusive[0] else "("
+        right_bracket = "]" if ci_inclusive[1] else ")"
+        print(f"{confidence_level}% CI: {left_bracket}{ci_lower:.2f}, {ci_upper:.2f}{right_bracket}")
+        if not all(ci_inclusive):
+            print("* Parentheses indicate an excluded endpoint.")
     print()
 
     if p_value < alpha:
@@ -1503,16 +1725,20 @@ def correlate(data, x, y, force_test=None, alpha=0.05):
 # works for both paired (paired=True) and independent (paired=False) samples.
 def compute_confidence_interval_difference(group1, group2, method="mean", paired=False, alpha=0.05, n_bootstrap=10000):
     """
-    Computes the confidence interval for the difference in means (parametric) or medians (non-parametric),
-    supporting both independent and dependent (paired) samples.
+    Computes a confidence interval for the difference in means (parametric) or
+    the Hodges-Lehmann location shift (non-parametric), supporting both
+    independent and dependent (paired) samples.
 
     Parameters:
         group1 (array-like): First sample.
         group2 (array-like): Second sample (paired or independent).
-        method (str): "mean" for parametric (t-test) or "median" for non-parametric (bootstrap CI).
+        method (str): "mean" for a t-test mean difference or "median" for a
+            test-inverted Hodges-Lehmann location shift. The name "median" is
+            retained for backward compatibility.
         paired (bool): If True, performs paired (dependent) tests instead of independent.
         alpha (float): Significance level (default is 0.05 for 95% CI).
-        n_bootstrap (int): Number of bootstrap samples (only for median method).
+        n_bootstrap (int): Retained for backward compatibility; test inversion
+            does not use bootstrap resampling.
 
     Returns:
         dict: Contains difference, confidence interval, test statistic, and p-value.
@@ -1564,72 +1790,80 @@ def compute_confidence_interval_difference(group1, group2, method="mean", paired
             ci_lower = mean_diff - t_crit * se_diff
             ci_upper = mean_diff + t_crit * se_diff
 
+        ci_inclusive = (True, True)
+        test_method = "t"
+
     elif method == "median":
         if paired:
             # --- Non-Parametric: Wilcoxon Signed-Rank Test (Paired) ---
-            # Use Hodges-Lehmann estimator (Walsh averages) for CI consistent with the Wilcoxon test
+            # Invert the same explicit Wilcoxon policy used for the p-value.
             diffs = np.asarray(group1, dtype=float) - np.asarray(group2, dtype=float)
-
-            # Exclude zero differences, consistent with Wilcoxon test default (zero_method='wilcox')
-            diffs_nonzero = diffs[diffs != 0]
-            n = len(diffs_nonzero)
-
+            n = len(diffs)
             if n == 0:
-                # All differences are zero: no meaningful CI
+                raise ValueError("Paired samples must contain at least one observation")
+
+            test_result = _wilcoxon_test(group1, group2)
+            test_stat, p_value = test_result.statistic, test_result.pvalue
+
+            if np.all(diffs == 0):
                 observed_diff = 0.0
                 ci_lower, ci_upper = 0.0, 0.0
+                ci_inclusive = (True, True)
             else:
                 # Walsh averages: (d_i + d_j) / 2 for all i <= j
-                walsh = np.array([(diffs_nonzero[i] + diffs_nonzero[j]) / 2
+                walsh = np.array([(diffs[i] + diffs[j]) / 2
                                   for i in range(n) for j in range(i, n)])
                 walsh.sort()
-                M = len(walsh)  # n*(n+1)/2
-
-                # Point estimate (Hodges-Lehmann pseudomedian of the differences)
                 observed_diff = np.median(walsh)
 
-                # CI bounds using normal approximation of the Wilcoxon signed-rank distribution
-                z = stats.norm.ppf(1 - alpha / 2)
-                C = int(np.floor(n * (n + 1) / 4 - z * np.sqrt(n * (n + 1) * (2 * n + 1) / 24)))
-                C = max(0, C)
-                # Guard against CI inversion with very small n
-                if C >= M - C:
-                    C = max(0, M // 2 - 1)
-                ci_lower = walsh[C]
-                ci_upper = walsh[M - 1 - C]
+                def wilcoxon_p_value_at(shift):
+                    if shift == 0:
+                        return p_value
+                    return _wilcoxon_test(diffs - shift).pvalue
 
-            # Perform Wilcoxon signed-rank test
-            test_stat, p_value = stats.wilcoxon(group1, group2)
+                (ci_lower, ci_upper), ci_inclusive = _test_inverted_interval(
+                    walsh,
+                    wilcoxon_p_value_at,
+                    observed_diff,
+                    alpha,
+                )
+            test_method = _WILCOXON_OPTIONS["method"]
 
         else:
             # --- Non-Parametric: Mann-Whitney U Test (Independent) ---
-            # Use Hodges-Lehmann estimator and Mann-Whitney based CI for consistency with the test
+            # Invert the same explicit Mann-Whitney policy used for the p-value.
             group1_arr = np.asarray(group1, dtype=float)
             group2_arr = np.asarray(group2, dtype=float)
             n1, n2 = len(group1_arr), len(group2_arr)
+            if n1 == 0 or n2 == 0:
+                raise ValueError("Independent samples must both contain observations")
+
+            test_method = _mann_whitney_method(group1_arr, group2_arr)
+            test_result = _mann_whitney_test(group1_arr, group2_arr, method=test_method)
+            test_stat, p_value = test_result.statistic, test_result.pvalue
 
             # All pairwise differences (Hodges-Lehmann estimator)
             all_diffs = (group1_arr[:, None] - group2_arr[None, :]).ravel()
             all_diffs.sort()
-            N = n1 * n2
-
-            # Point estimate (median of all pairwise differences)
             observed_diff = np.median(all_diffs)
 
-            # CI bounds using normal approximation of the Mann-Whitney U distribution
-            z = stats.norm.ppf(1 - alpha / 2)
-            C = int(np.floor(N / 2 - z * np.sqrt(n1 * n2 * (n1 + n2 + 1) / 12)))
-            C = max(0, C)
-            # Guard against CI inversion when N is very small
-            if C >= N - C:
-                C = max(0, N // 2 - 1)
-            ci_lower = all_diffs[C]
-            ci_upper = all_diffs[N - 1 - C]
+            def mann_whitney_p_value_at(shift):
+                if shift == 0:
+                    return p_value
+                return _mann_whitney_test(
+                    group1_arr - shift,
+                    group2_arr,
+                    method=test_method,
+                ).pvalue
 
-            # Perform Mann-Whitney U test
-            test_stat, p_value = stats.mannwhitneyu(group1, group2, alternative="two-sided")
+            (ci_lower, ci_upper), ci_inclusive = _test_inverted_interval(
+                all_diffs,
+                mann_whitney_p_value_at,
+                observed_diff,
+                alpha,
+            )
 
-        mean_diff = observed_diff  # Median difference is used in non-parametric case
+        mean_diff = observed_diff  # Hodges-Lehmann location-shift estimate
 
     else:
         raise ValueError("Invalid method. Choose 'mean' (parametric) or 'median' (non-parametric).")
@@ -1637,6 +1871,8 @@ def compute_confidence_interval_difference(group1, group2, method="mean", paired
     return {
         "difference": mean_diff,
         "CI": (ci_lower, ci_upper),
+        "CI_inclusive": ci_inclusive,
         "test_stat": test_stat,
-        "p_value": p_value
+        "p_value": p_value,
+        "test_method": test_method,
     }
