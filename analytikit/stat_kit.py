@@ -8,6 +8,7 @@
 import pandas as pd
 import numpy as np
 import scipy.stats as stats
+from scipy.optimize import brentq
 import pingouin as pg
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from scikit_posthocs import posthoc_dunn as dunn
@@ -78,7 +79,24 @@ _WILCOXON_OPTIONS = {
 
 def _display_p_value(p_value):
     """Round a p-value for display without changing the value used for inference."""
-    return round(float(p_value), 3)
+    value = float(p_value)
+    if value < 0.001:
+        return "<0.001"
+    return round(value, 3)
+
+
+def _effect_ci_display_decimals(interval, null_value, minimum=3, maximum=10):
+    """Avoid displaying an excluded null as if rounding put it on a CI bound."""
+    lower, upper = interval
+    null_is_excluded = upper < null_value or lower > null_value
+    if not null_is_excluded:
+        return minimum
+    for decimals in range(minimum, maximum + 1):
+        displayed_lower = round(lower, decimals)
+        displayed_upper = round(upper, decimals)
+        if not (displayed_lower <= null_value <= displayed_upper):
+            return decimals
+    return maximum
 
 
 def _mann_whitney_method(group1, group2):
@@ -106,6 +124,216 @@ def _mann_whitney_test(group1, group2, method=None):
         method=method,
         **_MANN_WHITNEY_OPTIONS,
     )
+
+
+def _mann_whitney_tie_factor(group1, group2):
+    """Return the standard WMW variance multiplier for pooled ties."""
+    pooled = np.concatenate((np.asarray(group1), np.asarray(group2)))
+    total = pooled.size
+    if total < 2:
+        return 1.0
+    counts = np.unique(pooled, return_counts=True)[1].astype(float)
+    return 1 - np.sum(counts**3 - counts) / (total * (total + 1) * (total - 1))
+
+
+def _mann_whitney_asymptotic_effect_ci(group1, group2, statistic, alpha):
+    """Fay-Malinovsky compatible CI for the Mann-Whitney probability.
+
+    This inverts the same tie-adjusted, continuity-corrected normal test used
+    by SciPy's asymptotic Mann-Whitney calculation. The variance away from the
+    null uses the LAPH model from Fay and Malinovsky (2018).
+    """
+    n1, n2 = len(group1), len(group2)
+    pair_count = n1 * n2
+    estimate = float(statistic) / pair_count
+    tie_factor = _mann_whitney_tie_factor(group1, group2)
+    if tie_factor == 0:
+        return (0.0, 1.0), tie_factor
+
+    def variance(parameter):
+        base = parameter * (1 - parameter) / pair_count
+        model_factor = 1 + ((n1 + n2 - 2) / 2) * (
+            (1 - parameter) / (2 - parameter) + parameter / (1 + parameter)
+        )
+        return tie_factor * base * model_factor
+
+    correction_less = -0.5 / pair_count
+    correction_greater = 0.5 / pair_count
+    epsilon = 1e-10
+
+    def root(z_quantile, correction):
+        def objective(parameter):
+            return (
+                (estimate - parameter - correction) / np.sqrt(variance(parameter))
+                - z_quantile
+            )
+
+        lower_value = objective(epsilon)
+        if lower_value <= 0:
+            return epsilon
+        upper_value = objective(1 - epsilon)
+        if upper_value >= 0:
+            return 1 - epsilon
+        return brentq(objective, epsilon, 1 - epsilon, xtol=1e-12)
+
+    if estimate == 0:
+        lower = 0.0
+    else:
+        lower = root(stats.norm.ppf(1 - alpha / 2), correction_greater)
+    if estimate == 1:
+        upper = 1.0
+    else:
+        upper = root(stats.norm.ppf(alpha / 2), correction_less)
+    return (lower, upper), tie_factor
+
+
+def _mann_whitney_order_distribution(n1, n2, parameter, descending=False):
+    """Distribution of U under the exact LAPH ordered-sample model.
+
+    A frontier dynamic program avoids enumerating all ``choose(n1+n2, n1)``
+    allocations. ``parameter`` is P(group1 > group2), with ties counting 1/2;
+    this exact branch is used only for tie-free samples.
+    """
+    maximum_u = n1 * n2
+    initial = np.zeros(maximum_u + 1, dtype=float)
+    initial[0] = 1.0
+    frontier = {0: initial}  # key: number of group-1 observations selected
+
+    for selected_total in range(n1 + n2):
+        next_frontier = {}
+        for selected_1, probabilities in frontier.items():
+            selected_2 = selected_total - selected_1
+            remaining_1 = n1 - selected_1
+            remaining_2 = n2 - selected_2
+            if descending:
+                denominator = parameter * remaining_1 + (1 - parameter) * remaining_2
+            else:
+                denominator = (1 - parameter) * remaining_1 + parameter * remaining_2
+
+            if remaining_1:
+                probability_1 = (
+                    parameter * remaining_1 / denominator
+                    if descending
+                    else (1 - parameter) * remaining_1 / denominator
+                )
+                increment = remaining_2 if descending else selected_2
+                destination = next_frontier.setdefault(
+                    selected_1 + 1, np.zeros(maximum_u + 1, dtype=float)
+                )
+                destination[increment:] += probability_1 * probabilities[:maximum_u + 1 - increment]
+
+            if remaining_2:
+                probability_2 = (
+                    (1 - parameter) * remaining_2 / denominator
+                    if descending
+                    else parameter * remaining_2 / denominator
+                )
+                destination = next_frontier.setdefault(
+                    selected_1, np.zeros(maximum_u + 1, dtype=float)
+                )
+                destination += probability_2 * probabilities
+        frontier = next_frontier
+
+    return frontier[n1]
+
+
+def _mann_whitney_exact_effect_ci(n1, n2, statistic, alpha):
+    """Exact central Fay-Malinovsky CI for a tie-free Mann-Whitney test."""
+    observed_u = int(round(float(statistic)))
+    maximum_u = n1 * n2
+    epsilon = 1e-10
+
+    def tails(parameter):
+        distribution = 0.5 * (
+            _mann_whitney_order_distribution(n1, n2, parameter, descending=False)
+            + _mann_whitney_order_distribution(n1, n2, parameter, descending=True)
+        )
+        return (
+            float(np.sum(distribution[:observed_u + 1])),
+            float(np.sum(distribution[observed_u:])),
+        )
+
+    if observed_u == 0:
+        lower = 0.0
+    else:
+        lower = brentq(
+            lambda parameter: tails(parameter)[1] - alpha / 2,
+            epsilon,
+            1 - epsilon,
+            xtol=1e-10,
+        )
+    if observed_u == maximum_u:
+        upper = 1.0
+    else:
+        upper = brentq(
+            lambda parameter: tails(parameter)[0] - alpha / 2,
+            epsilon,
+            1 - epsilon,
+            xtol=1e-10,
+        )
+    return (lower, upper)
+
+
+def mann_whitney_effect_ci(group1, group2, alpha=0.05, method=None):
+    """Estimate the Mann-Whitney probability and a test-compatible CI.
+
+    The probability is ``P(group1 > group2) + 0.5*P(group1 == group2)``.
+    Cliff's delta is its linear transformation ``2*probability - 1``.
+    The reported p-value is SciPy's existing two-sided Mann-Whitney p-value;
+    its resolved exact/asymptotic method is also used for the interval.
+
+    Method: Fay MP, Malinovsky Y. Statistics in Medicine. 2018;37:3991-4006.
+    doi:10.1002/sim.7890. The effect CI uses their LAPH/proportional-odds
+    working model; this assumption is not required by the WMW test itself.
+    """
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1")
+    first = np.asarray(group1, dtype=float)
+    second = np.asarray(group2, dtype=float)
+    if first.ndim != 1 or second.ndim != 1:
+        raise ValueError("Mann-Whitney samples must be one-dimensional")
+    if first.size == 0 or second.size == 0:
+        raise ValueError("Mann-Whitney samples must both contain observations")
+    if method is None:
+        method = _mann_whitney_method(first, second)
+
+    pooled = np.concatenate((first, second))
+    has_ties = np.unique(pooled).size < pooled.size
+    if method == "exact" and has_ties:
+        raise ValueError(
+            "The exact Mann-Whitney effect CI requires tie-free data; "
+            "use method='asymptotic' for tied or discrete observations"
+        )
+
+    test_result = _mann_whitney_test(first, second, method=method)
+    probability = float(test_result.statistic) / (first.size * second.size)
+    if method == "exact":
+        probability_ci = _mann_whitney_exact_effect_ci(
+            first.size, second.size, test_result.statistic, alpha
+        )
+        tie_factor = 1.0
+    elif method == "asymptotic":
+        probability_ci, tie_factor = _mann_whitney_asymptotic_effect_ci(
+            first, second, test_result.statistic, alpha
+        )
+    else:
+        raise ValueError("method must resolve to 'exact' or 'asymptotic'")
+
+    delta = 2 * probability - 1
+    delta_ci = tuple(2 * bound - 1 for bound in probability_ci)
+    return {
+        "probability_superiority": probability,
+        "probability_CI": probability_ci,
+        "cliffs_delta": delta,
+        "cliffs_delta_CI": delta_ci,
+        "p_value": float(test_result.pvalue),
+        "test_stat": float(test_result.statistic),
+        "test_method": method,
+        "tie_factor": tie_factor,
+        "null_probability": 0.5,
+        "null_delta": 0.0,
+        "ci_assumption": "LAPH/proportional-odds working model",
+    }
 
 
 def _paired_differences(group1, group2=None, difference_decimals=None):
@@ -451,13 +679,14 @@ def compare_ind(
     do_graphs=True,
     graphs_for_non_significance=False,
     subject_palette=None,
+    mann_whitney_location_shift_ci=False,
 ):  # Depends on print_mean_std()
     # Note: this function does not handle the independent variable (grouping variable). It assumes that the series are already grouped.
     # groups: a list of pandas series/columns to be compared
     # group_labels: a list of labels for the groups. If not provided, the group names + group number will be used as labels. The list of labels has to correspond to the list of groups.
     # force_test: if provided, the function will use the test provided instead of determining it automatically. The test has to be a string and has to be one of the following: "ttest", "one-way ANOVA", "mannwhitney", "kruskalwallis", "chisquare", 'fisherexact'
     # alpha: the alpha value to be used for the test. Default is 0.05
-    # data_type: 'cont' or 'cat'. If not provided, the function will attempt to infer it from the number of unique values (unreliable for low-resolution continuous variables).
+    # data_type: 'cont', 'ordinal', 'cat', or 'nominal'. Ordinal data uses rank tests directly. If not provided, the function attempts to infer a type from the number of unique values.
     # categorical_limit: fallback unique-value threshold used only when data_type is not set. Default is 20.
 
     # Declare vars
@@ -473,6 +702,8 @@ def compare_ind(
     ci_lower = None
     ci_upper = None
     ci_inclusive = (True, True)
+    mann_whitney_effect_result = None
+    mann_whitney_shift_result = None
 
     tukey_results = None
     dunn_results = None
@@ -512,10 +743,14 @@ def compare_ind(
         return
 
     # Determine if data is continuous or categorical
+    ordinal = data_type == "ordinal"
     if data_type == "cont":
         continuous = True
         print("Data type explicitly set to continuous.")
-    elif data_type in ("cat", "ordinal", "nominal"):
+    elif ordinal:
+        continuous = True
+        print("Data type explicitly set to ordinal; using rank-based inference.")
+    elif data_type in ("cat", "nominal"):
         continuous = False
         print("Data type explicitly set to categorical.")
     else:
@@ -533,7 +768,10 @@ def compare_ind(
 
         ### Normality Test ###
         # Use Shapiro-Wilk test to check for normality of each group
-        if force_non_normality:
+        if ordinal:
+            all_normal = False
+            print("Ordinal data is analyzed with non-parametric rank tests.")
+        elif force_non_normality:
             all_normal = False
             print("The compare function is forced to use non-parametric tests.")
         elif force_normality:
@@ -545,7 +783,7 @@ def compare_ind(
         index = 0
 
         for group in groups:
-            if not force_normality and not force_non_normality:
+            if not ordinal and not force_normality and not force_non_normality:
                 print_title("Test for Normality")
                 statistic, p_value = stats.shapiro(group)
                 statistic = round(statistic, 3)
@@ -679,36 +917,24 @@ def compare_ind(
                 groups[0], groups[1], method=mann_whitney_method
             )
 
-            #ci difference
-            ci_result = compute_confidence_interval_difference(groups[0], groups[1], method="median", paired=False, alpha=alpha)
-            ci_lower, ci_upper = ci_result["CI"]
-            ci_inclusive = ci_result["CI_inclusive"]
+            # Primary effect and confidence interval on the parameter directly
+            # associated with Mann-Whitney. This works on continuous, discrete,
+            # and ordinal scales and treats ties as half-wins.
+            mann_whitney_effect_result = mann_whitney_effect_ci(
+                groups[0],
+                groups[1],
+                alpha=alpha,
+                method=mann_whitney_method,
+            )
+            if mann_whitney_location_shift_ci:
+                mann_whitney_shift_result = compute_confidence_interval_difference(
+                    groups[0],
+                    groups[1],
+                    method="median",
+                    paired=False,
+                    alpha=alpha,
+                )
 
-            
-
-# # Compute the effect size (Cohen's U3) #N.B. #Cohen’s U₃ gives a percentile-based interpretation of effect size based on cohen's d#
-# n1 = len(groups[0])
-# n2 = len(groups[1])
-
-# R1 = (n1 * (n1 + n2 + 1)) / 2
-# R2 = n1 * n2 - R1
-
-# u3 = (R1 - R2) / n1
-# u3 = (statistic - (n1 * (n1 + 1)) / 2) / (n1 * n2)
-
-# effect_size["label"] = "Cohen's U3"
-# effect_size["value"] = u3
-
-            #MAHA# #Compute the effect size for Mann-Whitney U test (Cliff’s Delta (δ))
-            # delta = (2 * U) / (n1 * n2) - 1 
-            # where U is the Mann-Whitney U statistic, n1 is the number of observations in the first group, and n2 is the number of observations in the second group.
-            n1 = len(groups[0])
-            n2 = len(groups[1])
-            U = statistic  # Save unrounded for effect size calculation
-            delta = (2 * U) / (n1 * n2) - 1
-            effect_size["label"] = "Cliff's Delta (δ)"
-            effect_size["value"] = round(delta, 3)
-            
             # Round for display after using in calculations
             statistic = round(statistic, 3)
             
@@ -891,6 +1117,55 @@ def compare_ind(
     print(test_statistic_sign + ":", statistic)
 
     print("p-value:", _display_p_value(p_value))
+
+    if mann_whitney_effect_result is not None:
+        confidence_level = 100 - (alpha * 100)
+        probability = mann_whitney_effect_result["probability_superiority"]
+        probability_ci = mann_whitney_effect_result["probability_CI"]
+        delta = mann_whitney_effect_result["cliffs_delta"]
+        delta_ci = mann_whitney_effect_result["cliffs_delta_CI"]
+        probability_decimals = _effect_ci_display_decimals(
+            probability_ci, null_value=0.5
+        )
+        delta_decimals = _effect_ci_display_decimals(delta_ci, null_value=0.0)
+        print(
+            f"Probability of superiority ({group_labels[0]} > {group_labels[1]}, "
+            f"ties count as 0.5): {probability:.3f}"
+        )
+        print(
+            f"{confidence_level}% compatible CI: "
+            f"[{probability_ci[0]:.{probability_decimals}f}, "
+            f"{probability_ci[1]:.{probability_decimals}f}]"
+        )
+        print(f"Cliff's Delta (δ): {delta:.3f}")
+        print(
+            f"{confidence_level}% compatible CI for δ: "
+            f"[{delta_ci[0]:.{delta_decimals}f}, {delta_ci[1]:.{delta_decimals}f}]"
+        )
+        null_excluded = probability_ci[1] < 0.5 or probability_ci[0] > 0.5
+        print(
+            f"* Null values (probability = 0.5; δ = 0) are "
+            f"{'excluded from' if null_excluded else 'included in'} these intervals."
+        )
+        print(
+            "* Compatible effect intervals use the LAPH/proportional-odds "
+            "working model; the Mann-Whitney test itself does not require it."
+        )
+
+        if mann_whitney_shift_result is not None:
+            shift_ci = mann_whitney_shift_result["CI"]
+            shift_inclusive = mann_whitney_shift_result["CI_inclusive"]
+            left_bracket = "[" if shift_inclusive[0] else "("
+            right_bracket = "]" if shift_inclusive[1] else ")"
+            print(
+                f"Optional Hodges-Lehmann location-shift estimate: "
+                f"{mann_whitney_shift_result['difference']:.3f}"
+            )
+            print(
+                f"{confidence_level}% location-shift confidence set: "
+                f"{left_bracket}{shift_ci[0]:.3f}, {shift_ci[1]:.3f}{right_bracket}"
+            )
+            print("* Interpret this only when a common-shape location-shift model is defensible.")
     
     if ci_lower!=None and ci_upper!=None:
         confidence_level= 100-(alpha*100)
@@ -910,7 +1185,7 @@ def compare_ind(
 
 
     # Print effect size
-    if len(effect_size) > 0:
+    if len(effect_size) > 0 and mann_whitney_effect_result is None:
         print("Effect size (" + effect_size["label"] + "):", effect_size["value"])
 
     #Print post-hoc test results
@@ -1665,6 +1940,8 @@ def correlate(data, x, y, force_test=None, alpha=0.05):
         if key == "significance":
             color = "green" if str(value).lower().startswith("sign") else "red"
             printColor(f"{key}: {value}", color)
+        elif key == "p_value":
+            print(f"{key}:", _display_p_value(p_value))
         else:
             print(f"{key}:", value)
     
