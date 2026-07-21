@@ -230,91 +230,6 @@ def _test_inverted_interval(breakpoints, p_value_at, estimate, alpha):
 
 ## ci helpers are imported from helpers
 
-# Function to calculate confidence interval for a proportion ci
-def proportion_ci(count, nobs, alpha=0.05):
-    """
-    Calculate the confidence interval for a proportion.
-
-    Parameters:
-    count (int): The number of successes or events of interest.
-    nobs (int): The total number of observations or trials.
-    alpha (float, optional): The significance level. Defaults to 0.05.
-
-    Returns:
-    tuple: A tuple containing the lower and upper bounds of the confidence interval for the proportion.
-    """
-    # Type and value checks
-    if not isinstance(count, int) or not isinstance(nobs, int):
-        raise ValueError("count and nobs must be integers")
-    if not isinstance(alpha, float) or not (0 < alpha < 1):
-        raise ValueError("alpha must be a float between 0 and 1")
-    if count > nobs:
-        raise ValueError("count cannot be greater than nobs")
-    if nobs == 0:
-        raise ValueError("nobs must be greater than 0")
-
-    # Calculate confidence interval
-    ci_low, ci_upp = stats.binom.interval(alpha=1-alpha, n=nobs, p=count/nobs)
-    
-    # Normalize the interval
-    return ci_low/nobs, ci_upp/nobs
-
-
-#function to calculate the confidence interval for the difference between two independent means 
-def calculate_ci_diff(ci_list, mode):
-    """
-    Calculate the difference between confidence intervals for multiple groups.
-    
-    Parameters:
-    - ci_list: List of tuples [(lower1, upper1), (lower2, upper2), ...] for each group.
-    
-    Returns:
-    - Tuple containing (min_diff, max_diff) representing the range of CI differences.
-    """
-    if len(ci_list) < 2:
-        raise ValueError("At least two confidence intervals are required.")
-    
- 
-    ci_diffs = []
-    for i in range(len(ci_list)):
-        for j in range(i + 1, len(ci_list)):
-            lower_diff = ci_list[j][0] - ci_list[i][1]  # Lower bound of difference
-            upper_diff = ci_list[j][1] - ci_list[i][0]  # Upper bound of difference
-            ci_diffs.append((lower_diff, upper_diff))
-    
-    if mode=="mean":
-        return np.min([d[0] for d in ci_diffs]), np.max([d[1] for d in ci_diffs])
-    elif mode=="median":
-        #calculate 2.5 and 97.5 percentiles
-        return np.percentile([d[0] for d in ci_diffs], 2.5), np.percentile([d[1] for d in ci_diffs], 97.5)
-    # elif mode=="proportion":
-    #    
-    else:
-        raise ValueError("Invalid mode. Choose 'mean', 'median', or 'proportion'.")
-
-#function to combine mean_ci/ median_ci/ proportion_ci with calculate_ci_diff to calculate ci diff from series 
-def calculate_ci_diff_from_series(series_list, mode, num_samples=1000, alpha=0.05):
-    """
-    Calculate the difference between confidence intervals for multiple groups.
-    
-    Parameters:
-    - series_list: List of series for each group.
-    - mode: Type of CI to calculate. can be 'mean', 'median', or 'proportion'.
-    - alpha: Confidence level (default is 0.05).
-
-    Returns:
-    - Tuple containing (min_diff, max_diff) representing the range of CI differences.
-    """
-    if mode=="mean":
-        ci_list = [mean_ci(series) for series in series_list]
-    elif mode=="median":
-        ci_list = [median_ci(series, num_samples, alpha) for series in series_list]
-    # elif mode=="proportion":
-    #     ci_list = [proportion_ci(series.sum(), len(series)) for series in series_list]
-    else:
-        raise ValueError("Invalid mode. Choose 'mean', 'median', or 'proportion'.")
-    return calculate_ci_diff(ci_list, mode)
-
 ## print_mean_std moved to helpers
 
 
@@ -762,9 +677,6 @@ def compare_ind(
             # Use Kruskal-Wallis H test to compare all group
             statistic, p_value = stats.kruskal(*groups)
             statistic = round(statistic, 3)
-            #ci
-            # ci_lower, ci_upper=calculate_ci_diff_from_series(groups, 'median')
-
             #MAHA# # Compute the effect size for Kruskal-Wallis H (Epsilon Squared (ε²))
             N = sum(len(group) for group in groups)  # Total number of observations
             k = len(groups)  # Number of groups
@@ -933,20 +845,6 @@ def compare_ind(
         print(line2)
 
     print(test_statistic_sign + ":", statistic)
-
-    # #ci
-    
-    # if not continuous and 'contingency_table' in locals():
-    #     for col in contingency_table.columns:
-    #         count = contingency_table[col].sum()
-    #         ci_low, ci_upp = proportion_ci(count, n)
-    #         print(f"{col} proportion 95% CI: [{ci_low:.2f}, {ci_upp:.2f}]")
-
-    # if not continuous:
-    #     for col in contingency_table.columns:
-    #         count = contingency_table[col].sum()
-    #         ci_low, ci_upp = proportion_ci(count, n)
-    #         print(f"{col} proportion 95% CI: [{ci_low:.2f}, {ci_upp:.2f}]")
 
     print("p-value:", _display_p_value(p_value))
     
@@ -1550,20 +1448,6 @@ def compare_dep(
         print(line2)
 
     print(test_statistic_sign + ":", statistic)
-
-
-    # #print ci
-    # if not continuous and 'contingency_table' in locals():
-    #     for col in contingency_table.columns:
-    #         count = contingency_table[col].sum()
-    #         ci_low, ci_upp = proportion_ci(count, n)
-    #         print(f"{col} proportion 95% CI: [{ci_low:.2f}, {ci_upp:.2f}]")
-
-    # if not continuous:
-    #     for col in contingency_table.columns:
-    #         count = contingency_table[col].sum()
-    #         ci_low, ci_upp = proportion_ci(count, n)
-    #         print(f"{col} proportion 95% CI: [{ci_low:.2f}, {ci_upp:.2f}]")
 
 
     print("p-value:", _display_p_value(p_value))
