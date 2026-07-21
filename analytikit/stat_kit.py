@@ -73,7 +73,6 @@ _WILCOXON_OPTIONS = {
     "zero_method": "wilcox",
     "correction": False,
     "alternative": "two-sided",
-    "method": "auto",
 }
 
 
@@ -109,9 +108,54 @@ def _mann_whitney_test(group1, group2, method=None):
     )
 
 
-def _wilcoxon_test(group1, group2=None):
+def _paired_differences(group1, group2=None, difference_decimals=None):
+    """Return one clean difference vector for all paired rank inference.
+
+    SciPy recommends calculating paired differences before calling
+    ``wilcoxon`` because subtraction round-off can change ranks. Callers may
+    specify the measurement precision with ``difference_decimals``; no
+    rounding is applied by default.
+    """
+    first = np.asarray(group1, dtype=float)
+    differences = first if group2 is None else first - np.asarray(group2, dtype=float)
+    if differences.ndim != 1:
+        raise ValueError("Wilcoxon samples must be one-dimensional")
+    if difference_decimals is not None:
+        if not isinstance(difference_decimals, (int, np.integer)):
+            raise TypeError("difference_decimals must be an integer or None")
+        differences = np.round(differences, decimals=int(difference_decimals))
+    return differences
+
+
+def _wilcoxon_method(differences):
+    """Resolve SciPy's ``method='auto'`` policy once for an analysis.
+
+    Holding this method fixed during CI inversion is essential: candidate
+    shifts can create or remove ties and must not silently switch the
+    inferential algorithm part-way through the confidence-set calculation.
+    """
+    differences = np.asarray(differences, dtype=float)
+    n = differences.size
+    has_zeros = np.any(differences == 0)
+    absolute_nonzero = np.abs(differences[differences != 0])
+    has_ties = np.unique(absolute_nonzero).size < absolute_nonzero.size
+
+    # SciPy 1.17's deterministic auto policy: exhaustive inference remains
+    # feasible through n=13 with ties/zeros; otherwise exact inference is used
+    # through n=50 only when the data contain neither ties nor zeros.
+    if n <= 13 or (n <= 50 and not has_zeros and not has_ties):
+        return "exact"
+    return "asymptotic"
+
+
+def _wilcoxon_test(group1, group2=None, method=None, difference_decimals=None):
     """Run the package's explicit two-sided Wilcoxon signed-rank policy."""
-    return stats.wilcoxon(group1, group2, **_WILCOXON_OPTIONS)
+    differences = _paired_differences(group1, group2, difference_decimals)
+    if differences.size == 0:
+        raise ValueError("Paired samples must contain at least one observation")
+    if method is None:
+        method = _wilcoxon_method(differences)
+    return stats.wilcoxon(differences, method=method, **_WILCOXON_OPTIONS)
 
 
 def _test_inverted_interval(breakpoints, p_value_at, estimate, alpha):
@@ -970,6 +1014,7 @@ def compare_dep(
     data_type=None,
     do_graphs=True,
     graphs_for_non_significance=False,
+    difference_decimals=None,
 ):  # Depends on print_mean_std()
     # Note: this function does not handle the independent variable (grouping variable). It assumes that the series are already grouped.
     # groups: a list of pandas series/columns to be compared
@@ -988,6 +1033,7 @@ def compare_dep(
     ci_lower = None
     ci_upper = None
     ci_inclusive = (True, True)
+    ci_estimand = None
     use_median_for_plot = None
     all_normal = None
 
@@ -1217,13 +1263,27 @@ def compare_dep(
             line1 = "Not all data is normally distributed."
 
             # Use Wilcoxon signed-rank test to compare all group
-            statistic_raw, p_value = _wilcoxon_test(groups[0], groups[1])
+            differences = _paired_differences(
+                groups[0], groups[1], difference_decimals=difference_decimals
+            )
+            wilcoxon_method = _wilcoxon_method(differences)
+            statistic_raw, p_value = _wilcoxon_test(
+                differences, method=wilcoxon_method
+            )
             statistic = round(statistic_raw, 3)
 
             #ci difference
-            ci_result = compute_confidence_interval_difference(groups[0], groups[1], method="median", paired=True, alpha=alpha)
+            ci_result = compute_confidence_interval_difference(
+                groups[0],
+                groups[1],
+                method="median",
+                paired=True,
+                alpha=alpha,
+                difference_decimals=difference_decimals,
+            )
             ci_lower, ci_upper = ci_result["CI"]
             ci_inclusive = ci_result["CI_inclusive"]
+            ci_estimand = "Hodges-Lehmann pseudomedian of paired differences"
 
             # Compute the effect size for Wilcoxon signed-rank (r)
             # Use unrounded statistic; divide by sqrt(2n) per standard formula
@@ -1456,9 +1516,16 @@ def compare_dep(
         confidence_level= 100-(alpha*100)
         left_bracket = "[" if ci_inclusive[0] else "("
         right_bracket = "]" if ci_inclusive[1] else ")"
-        print(f"{confidence_level}% CI: {left_bracket}{ci_lower:.2f}, {ci_upper:.2f}{right_bracket}")
+        ci_name = f" CI for {ci_estimand}" if ci_estimand else " CI"
+        print(f"{confidence_level}%{ci_name}: {left_bracket}{ci_lower:.2f}, {ci_upper:.2f}{right_bracket}")
         if not all(ci_inclusive):
             print("* Parentheses indicate an excluded endpoint.")
+        if ci_estimand:
+            zero_is_included = (
+                (ci_lower < 0 or (ci_lower == 0 and ci_inclusive[0]))
+                and (ci_upper > 0 or (ci_upper == 0 and ci_inclusive[1]))
+            )
+            print(f"* Null value 0 is {'included in' if zero_is_included else 'excluded from'} this confidence set.")
     print()
 
     if p_value < alpha:
@@ -1607,7 +1674,15 @@ def correlate(data, x, y, force_test=None, alpha=0.05):
 # A function to calculate confidence interval difference between two groups
 # works both for parametric (method="mean") and non-parametric (method="median") tests
 # works for both paired (paired=True) and independent (paired=False) samples.
-def compute_confidence_interval_difference(group1, group2, method="mean", paired=False, alpha=0.05, n_bootstrap=10000):
+def compute_confidence_interval_difference(
+    group1,
+    group2,
+    method="mean",
+    paired=False,
+    alpha=0.05,
+    n_bootstrap=10000,
+    difference_decimals=None,
+):
     """
     Computes a confidence interval for the difference in means (parametric) or
     the Hodges-Lehmann location shift (non-parametric), supporting both
@@ -1623,6 +1698,10 @@ def compute_confidence_interval_difference(group1, group2, method="mean", paired
         alpha (float): Significance level (default is 0.05 for 95% CI).
         n_bootstrap (int): Retained for backward compatibility; test inversion
             does not use bootstrap resampling.
+        difference_decimals (int or None): For paired non-parametric inference,
+            round the precomputed paired differences to this many decimals
+            before ranking. Use the known measurement precision when floating
+            subtraction would otherwise create artificial rank differences.
 
     Returns:
         dict: Contains difference, confidence interval, test statistic, and p-value.
@@ -1681,12 +1760,15 @@ def compute_confidence_interval_difference(group1, group2, method="mean", paired
         if paired:
             # --- Non-Parametric: Wilcoxon Signed-Rank Test (Paired) ---
             # Invert the same explicit Wilcoxon policy used for the p-value.
-            diffs = np.asarray(group1, dtype=float) - np.asarray(group2, dtype=float)
+            diffs = _paired_differences(
+                group1, group2, difference_decimals=difference_decimals
+            )
             n = len(diffs)
             if n == 0:
                 raise ValueError("Paired samples must contain at least one observation")
 
-            test_result = _wilcoxon_test(group1, group2)
+            test_method = _wilcoxon_method(diffs)
+            test_result = _wilcoxon_test(diffs, method=test_method)
             test_stat, p_value = test_result.statistic, test_result.pvalue
 
             if np.all(diffs == 0):
@@ -1695,15 +1777,17 @@ def compute_confidence_interval_difference(group1, group2, method="mean", paired
                 ci_inclusive = (True, True)
             else:
                 # Walsh averages: (d_i + d_j) / 2 for all i <= j
-                walsh = np.array([(diffs[i] + diffs[j]) / 2
-                                  for i in range(n) for j in range(i, n)])
+                pair_sums = np.add.outer(diffs, diffs)
+                walsh = pair_sums[np.triu_indices(n)] / 2
                 walsh.sort()
                 observed_diff = np.median(walsh)
 
                 def wilcoxon_p_value_at(shift):
                     if shift == 0:
                         return p_value
-                    return _wilcoxon_test(diffs - shift).pvalue
+                    return _wilcoxon_test(
+                        diffs - shift, method=test_method
+                    ).pvalue
 
                 (ci_lower, ci_upper), ci_inclusive = _test_inverted_interval(
                     walsh,
@@ -1711,8 +1795,6 @@ def compute_confidence_interval_difference(group1, group2, method="mean", paired
                     observed_diff,
                     alpha,
                 )
-            test_method = _WILCOXON_OPTIONS["method"]
-
         else:
             # --- Non-Parametric: Mann-Whitney U Test (Independent) ---
             # Invert the same explicit Mann-Whitney policy used for the p-value.
@@ -1759,4 +1841,8 @@ def compute_confidence_interval_difference(group1, group2, method="mean", paired
         "test_stat": test_stat,
         "p_value": p_value,
         "test_method": test_method,
+        "null_value_included": (
+            (ci_lower < 0 or (ci_lower == 0 and ci_inclusive[0]))
+            and (ci_upper > 0 or (ci_upper == 0 and ci_inclusive[1]))
+        ),
     }
