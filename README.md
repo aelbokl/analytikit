@@ -258,7 +258,7 @@ If you add or change functionality:
 
 ## Authors
 
-Ahmed Elbokl (ahmed.elbokl@med.asu.edu.eg) and contributors.
+Ahmed Elbokl (ahmed.elbokl@med.asu.edu.eg), Maha Sabry and contributors.
 
 ## License
 
