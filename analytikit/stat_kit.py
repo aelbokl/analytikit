@@ -1927,10 +1927,11 @@ def correlate(data, x, y, force_test=None, alpha=0.05):
     # print()    
 
     # Return results
+    # Keep full precision in the returned values; round only for display.
     result={
         "method": method,
-        "correlation_coefficient": round(statistic, 3),
-        "p_value": round(p_value, 3),
+        "correlation_coefficient": float(statistic),
+        "p_value": float(p_value),
         "direction": direction,
         "significance": significance
     } 
@@ -1942,6 +1943,8 @@ def correlate(data, x, y, force_test=None, alpha=0.05):
             printColor(f"{key}: {value}", color)
         elif key == "p_value":
             print(f"{key}:", _display_p_value(p_value))
+        elif key == "correlation_coefficient":
+            print(f"{key}:", round(value, 3))
         else:
             print(f"{key}:", value)
     
@@ -2123,3 +2126,546 @@ def compute_confidence_interval_difference(
             and (ci_upper > 0 or (ci_upper == 0 and ci_inclusive[1]))
         ),
     }
+
+
+def _prepare_biserial_inputs(
+    data, continuous_var, binary_var, minimum_n=3, minimum_group_n=2
+):
+    """Validate and align one continuous and one dichotomous column.
+
+    Shared by the biserial correlations so all of them use the same level
+    ordering, and therefore the same sign convention.
+
+    Problems with the *data* (too few observations, a collapsed binary
+    variable, a group that is too small, a constant or non-numeric continuous
+    variable) print a yellow explanation and return ``None`` so that a loop
+    over many variable pairs reports the skip and carries on -- the same
+    convention ``correlate`` uses. Problems with the *call* (a missing column,
+    the same column passed twice) still raise, because no data would fix them.
+
+    Returns:
+        tuple or None: (data_clean, binary_levels, codes, group_sizes) where
+            ``codes`` is 0 for the first sorted level and 1 for the second, and
+            ``data_clean[continuous_var]`` has been coerced to float. ``None``
+            if the pair cannot support a biserial correlation.
+    """
+    for variable in (continuous_var, binary_var):
+        if variable not in data.columns:
+            raise ValueError(f'Column "{variable}" does not exist in the data.')
+    if continuous_var == binary_var:
+        raise ValueError("continuous_var and binary_var must be different columns.")
+
+    pair = f"'{continuous_var}' & '{binary_var}'"
+
+    def skip(reason):
+        printColor(f"Skipping {pair}: {reason}", "yellow")
+        return None
+
+    data_clean = data[[continuous_var, binary_var]].dropna().copy()
+    if len(data_clean) < minimum_n:
+        return skip(
+            f"only {len(data_clean)} complete observation(s) remain after dropping "
+            f"missing values — need at least {minimum_n}."
+        )
+
+    binary_levels = data_clean[binary_var].unique()
+    if len(binary_levels) != 2:
+        return skip(
+            f'"{binary_var}" has {len(binary_levels)} observed level(s) among the '
+            f"complete cases — need exactly 2. "
+            + (
+                "Every remaining case falls in the same category, so one group is "
+                "empty."
+                if len(binary_levels) < 2
+                else f"Found levels {sorted(map(str, binary_levels))}."
+            )
+        )
+    # Sort the levels so the sign of the coefficient does not depend on row order.
+    try:
+        binary_levels = sorted(binary_levels)
+    except TypeError:
+        binary_levels = list(binary_levels)
+
+    continuous_values = pd.to_numeric(data_clean[continuous_var], errors="coerce")
+    if continuous_values.isna().any():
+        return skip(f'"{continuous_var}" contains non-numeric values.')
+    if continuous_values.nunique() < 2:
+        return skip(
+            f'"{continuous_var}" has zero variance (all values are identical).'
+        )
+    # Store the coerced values so numeric-looking strings are not plotted as categories.
+    data_clean[continuous_var] = continuous_values.astype(float)
+
+    codes = pd.Categorical(
+        data_clean[binary_var], categories=binary_levels, ordered=True
+    ).codes
+    group_sizes = {
+        str(binary_levels[0]): int((codes == 0).sum()),
+        str(binary_levels[1]): int((codes == 1).sum()),
+    }
+    if min(group_sizes.values()) < minimum_group_n:
+        return skip(
+            f"group sizes are {group_sizes}; every group needs at least "
+            f"{minimum_group_n} observations for the effect size and its interval "
+            "to be estimable. Pass minimum_group_n=1 to analyze it anyway."
+        )
+    return data_clean, binary_levels, codes, group_sizes
+
+
+def _plot_biserial_groups(data_clean, continuous_var, binary_var, binary_levels, title):
+    """Draw the shared box/strip plot of the continuous values by group."""
+    plt.figure(figsize=(6, 4))
+    sns.boxplot(
+        data=data_clean,
+        x=binary_var,
+        y=continuous_var,
+        order=binary_levels,
+        color="lightblue",
+    )
+    sns.stripplot(
+        data=data_clean,
+        x=binary_var,
+        y=continuous_var,
+        order=binary_levels,
+        color="black",
+        alpha=0.65,
+        jitter=True,
+    )
+    plt.title(title)
+    plt.xlabel(binary_var)
+    plt.ylabel(continuous_var)
+    plt.tight_layout()
+    plt.show()
+
+
+def correlate_p_biserial(
+    data,
+    continuous_var,
+    binary_var,
+    alpha=0.05,
+    plot=True,
+    minimum_group_n=2,
+    _prepared=None,
+):
+    """Calculate a point-biserial correlation and plot values by binary group.
+
+    NB: normal distribution for the continuous variable is assumed.
+
+    The point-biserial correlation is the Pearson correlation between a
+    continuous variable and a 0/1 coded dichotomous variable. Its p-value is
+    algebraically identical to the equal-variance (Student) two-sample t-test,
+    so it inherits that test's assumptions: independent observations, roughly
+    normal values within each group, and equal variances. The magnitude of r is
+    also attenuated when the two groups are unbalanced, so compare it across
+    datasets only with that in mind.
+
+    Parameters:
+        data (pd.DataFrame): DataFrame containing the variables to analyze.
+        continuous_var (str): Name of the continuous numeric column.
+        binary_var (str): Name of the column with exactly two observed levels.
+        alpha (float): Significance level for hypothesis testing.
+        plot (bool): Whether to draw the box/strip plot. Default is True.
+        minimum_group_n (int): Smallest acceptable group size; smaller groups
+            are skipped rather than analyzed. Pass 1 to analyze anyway.
+
+    Returns:
+        dict or None: Correlation coefficient with its confidence interval,
+            p-value, direction, significance, and the group coding used for the
+            sign. ``None`` if the pair cannot support the correlation (see
+            ``_prepare_biserial_inputs``); a yellow message says why.
+
+    Raises:
+        ValueError: If either column is missing or both names are the same.
+    """
+    prepared = _prepared or _prepare_biserial_inputs(
+        data, continuous_var, binary_var, minimum_group_n=minimum_group_n
+    )
+    if prepared is None:
+        return None
+    data_clean, binary_levels, binary_values, group_sizes = prepared
+    reference_level, comparison_level = binary_levels[0], binary_levels[1]
+
+    statistic, p_value = stats.pointbiserialr(binary_values, data_clean[continuous_var])
+    statistic, p_value = float(statistic), float(p_value)
+
+    # Fisher z interval for r (approximate; needs n > 3 for a finite standard error).
+    n = len(data_clean)
+    if n > 3 and abs(statistic) < 1:
+        z = np.arctanh(statistic)
+        se = 1.0 / np.sqrt(n - 3)
+        z_crit = stats.norm.ppf(1 - alpha / 2)
+        ci_lower = float(np.tanh(z - z_crit * se))
+        ci_upper = float(np.tanh(z + z_crit * se))
+    else:
+        ci_lower, ci_upper = float("nan"), float("nan")
+
+    significance = "Significant" if p_value < alpha else "Not Significant"
+    if statistic > 0:
+        direction = "Positive correlation"
+    elif statistic < 0:
+        direction = "Negative correlation"
+    else:
+        direction = "No correlation"
+
+    if plot:
+        _plot_biserial_groups(
+            data_clean,
+            continuous_var,
+            binary_var,
+            binary_levels,
+            f"Point-Biserial Correlation: r = {statistic:.3f}, "
+            f"p = {_display_p_value(p_value)}",
+        )
+
+    result = {
+        "method": "point-biserial",
+        "correlation_coefficient": statistic,
+        "CI": (ci_lower, ci_upper),
+        "p_value": p_value,
+        "direction": direction,
+        "significance": significance,
+        "n": n,
+        "group_sizes": group_sizes,
+        "coding": f"0 = {reference_level}, 1 = {comparison_level}",
+        "null_value_included": (
+            None if np.isnan(ci_lower) else bool(ci_lower <= 0 <= ci_upper)
+        ),
+    }
+
+    print("method:", result["method"])
+    print("coding:", result["coding"], f"(n = {n}, {group_sizes})")
+    print("correlation_coefficient:", round(statistic, 3))
+    if np.isnan(ci_lower):
+        print(f"{int(round((1 - alpha) * 100))}% CI: not available")
+    else:
+        print(
+            f"{int(round((1 - alpha) * 100))}% CI:",
+            (round(ci_lower, 3), round(ci_upper, 3)),
+        )
+    print("p_value:", _display_p_value(p_value))
+    print("direction:", direction)
+    printColor(
+        f"significance: {significance}",
+        "green" if significance == "Significant" else "red",
+    )
+
+    return result
+
+
+def correlate_rank_biserial(
+    data,
+    continuous_var,
+    binary_var,
+    alpha=0.05,
+    plot=True,
+    method=None,
+    minimum_group_n=2,
+    _prepared=None,
+):
+    """Calculate a rank-biserial correlation and plot values by binary group.
+
+    NB: the non-parametric counterpart of ``correlate_p_biserial``. Use it when
+    the continuous variable is skewed, ordinal, or has outliers; no normality
+    or equal-variance assumption is made.
+
+    The rank-biserial correlation for two independent groups is Cliff's delta,
+    ``2 * P(group1 > group0) - 1``, where ties count as half a win. It is the
+    effect size that accompanies the Mann-Whitney U test, and the reported
+    p-value is that test's. Unlike Pearson's r it is a rank statistic, so it is
+    unaffected by monotone transformations of the continuous variable and is
+    not attenuated by group imbalance.
+
+    Parameters:
+        data (pd.DataFrame): DataFrame containing the variables to analyze.
+        continuous_var (str): Name of the continuous, skewed or ordinal column.
+        binary_var (str): Name of the column with exactly two observed levels.
+        alpha (float): Significance level for hypothesis testing.
+        plot (bool): Whether to draw the box/strip plot. Default is True.
+        method (str, optional): 'exact' or 'asymptotic'. Defaults to the
+            package's resolved Mann-Whitney policy.
+        minimum_group_n (int): Smallest acceptable group size; smaller groups
+            are skipped rather than analyzed. Pass 1 to analyze anyway.
+
+    Returns:
+        dict or None: Rank-biserial correlation (Cliff's delta) and the
+            equivalent probability of superiority, each with a confidence
+            interval, plus the Mann-Whitney p-value, direction, significance,
+            and the group coding used for the sign. ``None`` if the pair cannot
+            support the correlation; a yellow message says why.
+
+    Raises:
+        ValueError: If either column is missing or both names are the same.
+    """
+    prepared = _prepared or _prepare_biserial_inputs(
+        data, continuous_var, binary_var, minimum_group_n=minimum_group_n
+    )
+    if prepared is None:
+        return None
+    data_clean, binary_levels, binary_values, group_sizes = prepared
+    reference_level, comparison_level = binary_levels[0], binary_levels[1]
+
+    values = data_clean[continuous_var].to_numpy()
+    group0 = values[binary_values == 0]
+    group1 = values[binary_values == 1]
+
+    # Order matters: group1 first makes a positive coefficient mean that the
+    # level coded 1 has the higher values, matching correlate_p_biserial.
+    effect = mann_whitney_effect_ci(group1, group0, alpha=alpha, method=method)
+    statistic = effect["cliffs_delta"]
+    ci_lower, ci_upper = effect["cliffs_delta_CI"]
+    p_value = effect["p_value"]
+
+    significance = "Significant" if p_value < alpha else "Not Significant"
+    if statistic > 0:
+        direction = "Positive correlation"
+    elif statistic < 0:
+        direction = "Negative correlation"
+    else:
+        direction = "No correlation"
+
+    n = len(data_clean)
+    group_medians = {
+        str(reference_level): float(np.median(group0)),
+        str(comparison_level): float(np.median(group1)),
+    }
+
+    if plot:
+        _plot_biserial_groups(
+            data_clean,
+            continuous_var,
+            binary_var,
+            binary_levels,
+            f"Rank-Biserial Correlation: r_rb = {statistic:.3f}, "
+            f"p = {_display_p_value(p_value)}",
+        )
+
+    result = {
+        "method": "rank-biserial",
+        "correlation_coefficient": statistic,
+        "CI": (ci_lower, ci_upper),
+        "probability_superiority": effect["probability_superiority"],
+        "probability_CI": effect["probability_CI"],
+        "p_value": p_value,
+        "direction": direction,
+        "significance": significance,
+        "n": n,
+        "group_sizes": group_sizes,
+        "group_medians": group_medians,
+        "coding": f"0 = {reference_level}, 1 = {comparison_level}",
+        "test_stat": effect["test_stat"],
+        "test_method": effect["test_method"],
+        "ci_assumption": effect["ci_assumption"],
+        "null_value_included": bool(ci_lower <= 0 <= ci_upper),
+    }
+
+    decimals = _effect_ci_display_decimals((ci_lower, ci_upper), 0.0)
+    confidence = int(round((1 - alpha) * 100))
+    print("method:", result["method"], f"(Mann-Whitney, {effect['test_method']})")
+    print("coding:", result["coding"], f"(n = {n}, {group_sizes})")
+    print("group_medians:", {k: round(v, 3) for k, v in group_medians.items()})
+    print("correlation_coefficient:", round(statistic, 3), "(Cliff's delta)")
+    print(
+        f"{confidence}% CI:",
+        (round(ci_lower, decimals), round(ci_upper, decimals)),
+    )
+    print(
+        "probability_superiority:",
+        round(effect["probability_superiority"], 3),
+        f"({confidence}% CI",
+        tuple(round(bound, 3) for bound in effect["probability_CI"]),
+        ")",
+    )
+    print("p_value:", _display_p_value(p_value))
+    print("direction:", direction)
+    printColor(
+        f"significance: {significance}",
+        "green" if significance == "Significant" else "red",
+    )
+
+    return result
+
+
+def correlate_biserial(
+    data,
+    continuous_var,
+    binary_var,
+    alpha=0.05,
+    plot=True,
+    force_test=None,
+    force_normality=False,
+    force_non_normality=False,
+    data_type=None,
+    method=None,
+    minimum_group_n=2,
+):
+    """Choose between the point-biserial and rank-biserial correlation.
+
+    Runs Shapiro-Wilk on the continuous variable *within each group* and then
+    delegates to ``correlate_p_biserial`` when both groups are normal, or to
+    ``correlate_rank_biserial`` otherwise. Normality is assessed per group
+    because that -- not the normality of the pooled column -- is the assumption
+    behind the point-biserial correlation. Pooled values from two groups with
+    different locations form a mixture that can fail Shapiro-Wilk even when
+    both groups are perfectly normal.
+
+    Parameters:
+        data (pd.DataFrame): DataFrame containing the variables to analyze.
+        continuous_var (str): Name of the continuous numeric column.
+        binary_var (str): Name of the column with exactly two observed levels.
+        alpha (float): Significance level, used both for the normality
+            screen and for the correlation itself.
+        plot (bool): Whether to draw the box/strip plot. Default is True.
+        force_test (str, optional): 'point-biserial' or 'rank-biserial' to skip
+            the normality screen and use that test.
+        force_normality (bool): Skip the screen and treat both groups as normal.
+        force_non_normality (bool): Skip the screen and use rank-based inference.
+        data_type (str, optional): 'cont' or 'ordinal'. Ordinal data goes
+            straight to the rank-biserial correlation.
+        method (str, optional): Passed to ``correlate_rank_biserial`` as its
+            Mann-Whitney method; ignored by the parametric branch.
+        minimum_group_n (int): Smallest acceptable group size; smaller groups
+            are skipped rather than analyzed. Pass 1 to analyze anyway.
+
+    Returns:
+        dict or None: The delegate's result dictionary, plus a ``normality``
+            entry recording the screen and a ``selected_method`` entry.
+            ``None`` if the pair cannot support a biserial correlation, so that
+            a loop over many variable pairs reports the skip and continues.
+
+    Raises:
+        ValueError: If either column is missing, both names are the same, or a
+            forcing argument is contradictory or unrecognised.
+    """
+    if force_normality and force_non_normality:
+        raise ValueError(
+            "force_normality and force_non_normality cannot both be True."
+        )
+    if data_type is not None and data_type not in ("cont", "ordinal"):
+        raise ValueError(
+            "data_type must be 'cont' or 'ordinal' for a biserial correlation; "
+            f"got {data_type!r}."
+        )
+    valid_tests = ("point-biserial", "rank-biserial")
+    if force_test is not None and force_test not in valid_tests:
+        raise ValueError(f"force_test must be one of {valid_tests}; got {force_test!r}.")
+
+    # Validate once here so the normality screen runs on clean, aligned data.
+    # The delegate re-runs the same preparation; it is cheap and keeps each
+    # correlation function usable on its own.
+    prepared = _prepare_biserial_inputs(
+        data, continuous_var, binary_var, minimum_group_n=minimum_group_n
+    )
+    if prepared is None:
+        return None
+    data_clean, binary_levels, binary_values, group_sizes = prepared
+    values = data_clean[continuous_var].to_numpy()
+    groups = [values[binary_values == 0], values[binary_values == 1]]
+
+    normality = {
+        "test": "Shapiro-Wilk",
+        "alpha": alpha,
+        "by_group": {},
+        "all_normal": None,
+        "basis": None,
+    }
+
+    # --- Decide which test to run ---
+    if force_test is not None:
+        selected = force_test
+        normality["basis"] = f"force_test={force_test!r}"
+        print(f"force_test={force_test!r}: skipping the normality screen.")
+    elif data_type == "ordinal":
+        selected = "rank-biserial"
+        normality["all_normal"] = False
+        normality["basis"] = "data_type='ordinal'"
+        print("Ordinal data is analyzed with non-parametric rank tests.")
+    elif force_non_normality:
+        selected = "rank-biserial"
+        normality["all_normal"] = False
+        normality["basis"] = "force_non_normality=True"
+        print("The correlate_biserial function is forced to use non-parametric tests.")
+    elif force_normality:
+        selected = "point-biserial"
+        normality["all_normal"] = True
+        normality["basis"] = "force_normality=True"
+        print("The correlate_biserial function is forced to use parametric tests.")
+    else:
+        ### Normality Test ###
+        # Shapiro-Wilk per group; every group must pass for the parametric branch.
+        print_title("Test for Normality")
+        all_normal = True
+        for level, group in zip(binary_levels, groups):
+            print(f"Test for normality (Shapiro-Wilk) for {binary_var} = {level}")
+            print("-------------------------------------------------")
+            if group.size < 3:
+                print(
+                    f"Only {group.size} observation(s): Shapiro-Wilk needs at least 3. "
+                    "Assuming non-normality."
+                )
+                is_normal = False
+                statistic, p_value = float("nan"), float("nan")
+            elif group.size > 5000:
+                print(
+                    f"{group.size} observations: skipping Shapiro-Wilk and assuming "
+                    "normality for a large sample."
+                )
+                is_normal = True
+                statistic, p_value = float("nan"), float("nan")
+            elif np.unique(group).size == 1:
+                print("All values are identical: assuming non-normality.")
+                is_normal = False
+                statistic, p_value = float("nan"), float("nan")
+            else:
+                statistic, p_value = stats.shapiro(group)
+                statistic, p_value = float(statistic), float(p_value)
+                print("Statistic:", round(statistic, 3))
+                print("p-value:", _display_p_value(p_value))
+                is_normal = p_value > alpha
+                if is_normal:
+                    print("Data is normally distributed.")
+                else:
+                    print("Data is not normally distributed.")
+            normality["by_group"][str(level)] = {
+                "n": int(group.size),
+                "statistic": statistic,
+                "p_value": p_value,
+                "normal": is_normal,
+            }
+            all_normal = all_normal and is_normal
+            print()
+
+        normality["all_normal"] = all_normal
+        normality["basis"] = "Shapiro-Wilk within each group"
+        selected = "point-biserial" if all_normal else "rank-biserial"
+        if all_normal:
+            print("All data is normally distributed.")
+        else:
+            print("Not all data is normally distributed.")
+
+    if selected == "point-biserial":
+        print("Using the point-biserial correlation (parametric).")
+        print()
+        result = correlate_p_biserial(
+            data_clean,
+            continuous_var,
+            binary_var,
+            alpha=alpha,
+            plot=plot,
+            _prepared=prepared,
+        )
+    else:
+        print("Using the rank-biserial correlation (non-parametric).")
+        print()
+        result = correlate_rank_biserial(
+            data_clean,
+            continuous_var,
+            binary_var,
+            alpha=alpha,
+            plot=plot,
+            method=method,
+            _prepared=prepared,
+        )
+
+    result["selected_method"] = selected
+    result["normality"] = normality
+    return result
