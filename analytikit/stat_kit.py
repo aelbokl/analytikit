@@ -14,12 +14,19 @@ from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from scikit_posthocs import posthoc_dunn as dunn
 import scikit_posthocs as sp
 import copy
+from collections import namedtuple
 import math 
 import warnings
 from statsmodels.stats.contingency_tables import mcnemar
 from statsmodels.stats.contingency_tables import cochrans_q
 from statsmodels.stats.contingency_tables import SquareTable 
 from scipy.stats import friedmanchisquare
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.stats.outliers_influence import variance_inflation_factor, OLSInfluence
+from statsmodels.stats.diagnostic import het_breuschpagan, linear_reset
+from statsmodels.tools.sm_exceptions import PerfectSeparationError
+import re
 import colorsys
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -75,6 +82,141 @@ _WILCOXON_OPTIONS = {
     "correction": False,
     "alternative": "two-sided",
 }
+
+
+def _scipy_wilcoxon_capabilities():
+    """Probe how the installed SciPy spells and implements Wilcoxon inference.
+
+    Two things vary across SciPy releases. The non-exact method was renamed
+    from ``method="approx"`` to ``method="asymptotic"``, and the exact path was
+    changed from the tabulated no-ties signed-rank distribution to exhaustive
+    inference that is also valid when the differences contain ties or zeros.
+    Both are probed by behaviour rather than by version string, so the
+    package's own vocabulary ("exact" / "asymptotic") stays stable and the
+    resolved policy never asks SciPy for an exact calculation it cannot
+    actually perform.
+    """
+    # Distinct absolute values, so the only feature under test is the zero.
+    probe = np.array(
+        [-1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0, 8.0, -9.0, 10.0, -11.0, 12.0]
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        asymptotic_name = None
+        for candidate in ("asymptotic", "approx"):
+            try:
+                stats.wilcoxon(probe, method=candidate, **_WILCOXON_OPTIONS)
+            except ValueError:
+                continue
+            asymptotic_name = candidate
+            break
+        if asymptotic_name is None:
+            raise RuntimeError(
+                "SciPy's wilcoxon accepts neither method='asymptotic' nor "
+                "method='approx'; the package's Wilcoxon policy cannot be "
+                "applied to this SciPy version"
+            )
+
+        # A SciPy whose exact path cannot represent zeros silently falls back
+        # to the non-exact calculation and returns an identical p-value.
+        zero_probe = np.append(probe, 0.0)
+        exact_p = stats.wilcoxon(
+            zero_probe, method="exact", **_WILCOXON_OPTIONS
+        ).pvalue
+        asymptotic_p = stats.wilcoxon(
+            zero_probe, method=asymptotic_name, **_WILCOXON_OPTIONS
+        ).pvalue
+
+    exhaustive = not np.isclose(exact_p, asymptotic_p, rtol=1e-12, atol=0.0)
+    return asymptotic_name, exhaustive
+
+
+_SCIPY_WILCOXON_ASYMPTOTIC, _WILCOXON_EXACT_HANDLES_TIES = (
+    _scipy_wilcoxon_capabilities()
+)
+
+
+def _scipy_wilcoxon_method(method):
+    """Translate the package's method vocabulary into this SciPy's spelling."""
+    if method in ("asymptotic", "approx"):
+        return _SCIPY_WILCOXON_ASYMPTOTIC
+    return method
+
+
+_WilcoxonResult = namedtuple("WilcoxonResult", ["statistic", "pvalue"])
+
+
+def _wilcoxon_signed_rank_statistics(differences):
+    """Return ``(statistic, r_plus_ranks, absolute_midranks)`` for the test.
+
+    Zeros are discarded before ranking, which is what ``zero_method="wilcox"``
+    means, and the reported statistic is ``min(r_plus, r_minus)`` to match
+    SciPy's two-sided convention.
+    """
+    nonzero = differences[differences != 0]
+    if nonzero.size == 0:
+        raise ValueError(
+            "zero_method 'wilcox' and 'pratt' do not work if x - y is zero "
+            "for all elements."
+        )
+    midranks = stats.rankdata(np.abs(nonzero))
+    r_plus = float(midranks[nonzero > 0].sum())
+    r_minus = float(midranks[nonzero < 0].sum())
+    return min(r_plus, r_minus), r_plus, midranks
+
+
+def _wilcoxon_needs_exact_fallback(differences):
+    """Whether SciPy's own exact path cannot honour an exact request here.
+
+    SciPy releases whose exact path is the tabulated no-ties signed-rank
+    distribution silently substitute the asymptotic calculation when a zero is
+    present, and silently discard ties when one is not.
+    """
+    if _WILCOXON_EXACT_HANDLES_TIES:
+        return False
+    absolute_nonzero = np.abs(differences[differences != 0])
+    has_zeros = absolute_nonzero.size != differences.size
+    has_ties = np.unique(absolute_nonzero).size != absolute_nonzero.size
+    return has_zeros or has_ties
+
+
+def _wilcoxon_exact_test(differences):
+    """Exact two-sided signed-rank test that remains valid with ties and zeros.
+
+    Conditional on the observed absolute midranks, the null distribution of
+    ``r_plus`` is the distribution of the sum of a uniformly random subset of
+    those midranks, because each non-zero difference is equally likely to carry
+    either sign. That distribution is obtained exactly by convolution, so no
+    enumeration of the 2**n sign patterns is needed and the calculation stays
+    cheap across the whole range of sample sizes for which the package resolves
+    an exact method.
+
+    This reproduces the exhaustive calculation performed by newer SciPy
+    releases. It is used only where the installed SciPy's own exact path cannot
+    represent ties or zeros; there, SciPy silently discards ties and truncates
+    a half-integral ``r_plus``, and silently substitutes the asymptotic
+    calculation when a zero is present. Either substitution would break the
+    fixed-method invariant that confidence-interval inversion depends on, since
+    candidate shifts routinely create both ties and zeros.
+    """
+    statistic, r_plus, midranks = _wilcoxon_signed_rank_statistics(differences)
+
+    # Midranks are integers or half-integers, so doubling them makes the whole
+    # convolution exact in integer arithmetic.
+    doubled = np.rint(midranks * 2.0).astype(np.int64)
+    total = int(doubled.sum())
+    distribution = np.zeros(total + 1)
+    distribution[0] = 1.0
+    for weight in doubled:
+        shifted = np.zeros(total + 1)
+        shifted[weight:] = distribution[: total + 1 - weight]
+        distribution = 0.5 * (distribution + shifted)
+
+    observed = int(np.rint(r_plus * 2.0))
+    cumulative = distribution[: observed + 1].sum()
+    survival = distribution[observed:].sum()
+    p_value = min(1.0, 2.0 * min(cumulative, survival))
+    return _WilcoxonResult(statistic=statistic, pvalue=p_value)
 
 
 def _display_p_value(p_value):
@@ -368,9 +510,12 @@ def _wilcoxon_method(differences):
     absolute_nonzero = np.abs(differences[differences != 0])
     has_ties = np.unique(absolute_nonzero).size < absolute_nonzero.size
 
-    # SciPy 1.17's deterministic auto policy: exhaustive inference remains
-    # feasible through n=13 with ties/zeros; otherwise exact inference is used
-    # through n=50 only when the data contain neither ties nor zeros.
+    # Exhaustive inference remains feasible through n=13 with ties or zeros;
+    # otherwise exact inference is used through n=50 only when the data contain
+    # neither ties nor zeros. The policy is deliberately independent of the
+    # installed SciPy: where SciPy's own exact path cannot represent ties or
+    # zeros, `_wilcoxon_test` supplies the exhaustive calculation itself rather
+    # than letting the resolved method be silently substituted.
     if n <= 13 or (n <= 50 and not has_zeros and not has_ties):
         return "exact"
     return "asymptotic"
@@ -383,7 +528,11 @@ def _wilcoxon_test(group1, group2=None, method=None, difference_decimals=None):
         raise ValueError("Paired samples must contain at least one observation")
     if method is None:
         method = _wilcoxon_method(differences)
-    return stats.wilcoxon(differences, method=method, **_WILCOXON_OPTIONS)
+    if method == "exact" and _wilcoxon_needs_exact_fallback(differences):
+        return _wilcoxon_exact_test(differences)
+    return stats.wilcoxon(
+        differences, method=_scipy_wilcoxon_method(method), **_WILCOXON_OPTIONS
+    )
 
 
 def _test_inverted_interval(breakpoints, p_value_at, estimate, alpha):
@@ -2669,3 +2818,1289 @@ def correlate_biserial(
     result["selected_method"] = selected
     result["normality"] = normality
     return result
+
+
+################################################################################################
+#                                        REGRESSION
+################################################################################################
+# regress() follows the same "inspect the data, then choose" idea used by compare_ind() and
+# compare_dep(), but with one deliberate difference: regression assumptions can only be checked
+# after a model is fitted, and there is no single agreed-upon fallback when one fails. So the
+# model family is chosen from the outcome variable up front, and the post-fit diagnostics are
+# reported rather than used to silently switch models. The only automatic change is the
+# covariance estimator (robust standard errors under heteroscedasticity), which leaves the
+# fitted model itself untouched.
+
+
+# Model families implemented so far. Named here so force_model can tell "not a model" apart
+# from "a real model that is not built yet".
+_REGRESSION_IMPLEMENTED_MODELS = ("linear", "logistic")
+_REGRESSION_PLANNED_MODELS = ("poisson", "negativebinomial", "ordinal", "multinomial", "cox")
+
+
+def _regression_quote(name):
+    """Wrap a column name so patsy accepts names with spaces, dashes or leading digits."""
+    if name.isidentifier():
+        return name
+    escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+    return f"Q('{escaped}')"
+
+
+def _regression_is_categorical(series, categorical_limit):
+    """Decide whether a predictor should enter the model as a factor rather than a number."""
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        return True
+    if series.dtype == bool or series.dtype == object:
+        return True
+    # Numeric but with very few distinct values is ambiguous; treat as numeric and let the
+    # user override, because silently dummy-coding a numeric dose or score would be worse.
+    return False
+
+
+def _regression_reference_level(series, requested):
+    """Pick the reference (baseline) level for a categorical predictor."""
+    levels = list(pd.Categorical(series).categories)
+    if requested is None:
+        return levels[0], levels
+    if requested not in levels:
+        raise Exception(
+            f'Reference level "{requested}" was not found in "{series.name}". '
+            f"Available levels: {levels}."
+        )
+    return requested, levels
+
+
+def _regression_build_formula(outcome, predictors, data, reference, categorical_limit):
+    """
+    Build a patsy formula from an outcome and a list of predictors.
+
+    Categorical predictors are wrapped in C(...) with an explicit Treatment reference so the
+    baseline level is chosen deliberately rather than by accident of sort order.
+    """
+    reference = reference or {}
+    unknown_reference = [name for name in reference if name not in predictors]
+    if unknown_reference:
+        printColor(
+            f"Warning: reference level(s) given for variable(s) not in predictors and ignored: "
+            f"{', '.join(map(str, unknown_reference))}.",
+            "yellow",
+        )
+
+    terms = []
+    reference_levels = {}
+    for name in predictors:
+        series = data[name]
+        if _regression_is_categorical(series, categorical_limit):
+            baseline, levels = _regression_reference_level(series, reference.get(name))
+            reference_levels[name] = {"reference": baseline, "levels": levels}
+            escaped = str(baseline).replace("\\", "\\\\").replace("'", "\\'")
+            terms.append(f"C({_regression_quote(name)}, Treatment(reference='{escaped}'))")
+        else:
+            if name in reference:
+                printColor(
+                    f'Warning: "{name}" is numeric, so the reference level given for it is ignored.',
+                    "yellow",
+                )
+            terms.append(_regression_quote(name))
+
+    formula = f"{_regression_quote(outcome)} ~ " + " + ".join(terms)
+    return formula, reference_levels
+
+
+def _regression_formula_outcome(formula, data):
+    """Extract the outcome column name from a user-supplied formula's left-hand side."""
+    if "~" not in formula:
+        raise Exception(
+            f'The formula "{formula}" has no "~". A formula must look like "outcome ~ age + sex".'
+        )
+    left = formula.split("~", 1)[0].strip()
+    if left in data.columns:
+        return left
+    # Allow an explicitly quoted name such as Q('body mass index').
+    for quote in ("Q('", 'Q("'):
+        if left.startswith(quote) and left.endswith(quote[-1] + ")"):
+            inner = left[len(quote):-2]
+            if inner in data.columns:
+                return inner
+    return None
+
+
+def _regression_formula_columns(formula, data):
+    """Find which DataFrame columns a formula refers to, so we can drop rows listwise."""
+
+    tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", formula))
+    quoted = set(re.findall(r"Q\(\s*['\"](.+?)['\"]\s*\)", formula))
+    used = [column for column in data.columns if column in tokens or column in quoted]
+    return used
+
+
+def _regression_select_model(
+    outcome_series, outcome_name, outcome_type, force_model, categorical_limit, alpha
+):
+    """
+    Choose the model family from the outcome variable.
+
+    Unlike compare_ind(), the choice here does not depend on any assumption test - it depends
+    only on what kind of thing the outcome is, which is why it can be settled before fitting.
+    """
+    if force_model is not None:
+        model = str(force_model).strip().lower().replace(" ", "").replace("_", "")
+        if model in _REGRESSION_IMPLEMENTED_MODELS:
+            print(f"force_model='{model}': fitting a {model} model without inspecting the outcome.")
+            return model
+        if model in _REGRESSION_PLANNED_MODELS:
+            raise Exception(
+                f'force_model="{force_model}" is a recognised model family but is not implemented '
+                f"yet. Currently available: {', '.join(_REGRESSION_IMPLEMENTED_MODELS)}."
+            )
+        raise Exception(
+            f'force_model="{force_model}" is not recognised. '
+            f"Options are: {', '.join(_REGRESSION_IMPLEMENTED_MODELS)}."
+        )
+
+    n_unique = outcome_series.nunique(dropna=True)
+
+    if outcome_type == "cont":
+        print("Outcome type explicitly set to continuous; fitting a linear model.")
+        return "linear"
+    if outcome_type in ("cat", "nominal", "binary", "ordinal"):
+        if n_unique != 2:
+            raise Exception(
+                f'Outcome "{outcome_name}" was declared categorical but has {n_unique} levels. '
+                f"Stage 1 supports binary outcomes only; multinomial and ordinal models are not "
+                f"implemented yet."
+            )
+        print("Outcome type explicitly set to categorical with 2 levels; fitting a logistic model.")
+        return "logistic"
+
+    # Inferred - warn in the same style as compare_ind(), because a wrong guess here is costly.
+    if n_unique == 2:
+        model = "logistic"
+        basis = "the outcome has exactly 2 levels"
+    elif pd.api.types.is_numeric_dtype(outcome_series) and n_unique > categorical_limit:
+        model = "linear"
+        basis = f"the outcome is numeric with {n_unique} distinct values"
+    elif pd.api.types.is_numeric_dtype(outcome_series):
+        model = "linear"
+        basis = (
+            f"the outcome is numeric with only {n_unique} distinct values, which is fewer than "
+            f"categorical_limit ({categorical_limit})"
+        )
+    else:
+        raise Exception(
+            f'Cannot infer a model for outcome "{outcome_name}": it is not numeric and has '
+            f"{n_unique} levels. Stage 1 supports continuous and binary outcomes. Set "
+            f"outcome_type or force_model explicitly."
+        )
+
+    printColor(
+        f"Warning: outcome_type not set. Selecting a {model} model because {basis}. "
+        f"Pass outcome_type='cont' or outcome_type='cat' (or force_model) to suppress this warning.",
+        "yellow",
+    )
+    return model
+
+
+def _regression_encode_binary_outcome(data, outcome, outcome_positive):
+    """
+    Recode a binary outcome to 0/1 and report which level is being modelled as the event.
+
+    Doing this explicitly (rather than leaving it to patsy) is what makes the direction of every
+    odds ratio unambiguous, which is the single most common way a logistic result is misread.
+    """
+    levels = list(pd.Series(data[outcome].unique()).dropna())
+    try:
+        levels = sorted(levels)
+    except TypeError:
+        levels = list(levels)
+
+    if len(levels) != 2:
+        raise Exception(
+            f'A logistic model needs a binary outcome, but "{outcome}" has {len(levels)} '
+            f"level(s): {levels}."
+        )
+
+    if outcome_positive is None:
+        # Default to the higher/later level as the event, which makes 1 the event for 0/1 data.
+        event = levels[1]
+    else:
+        if outcome_positive not in levels:
+            raise Exception(
+                f'outcome_positive="{outcome_positive}" is not a level of "{outcome}". '
+                f"Levels are: {levels}."
+            )
+        event = outcome_positive
+
+    baseline = [level for level in levels if level != event][0]
+    encoded = data[outcome].apply(lambda value: 1 if value == event else 0).astype(float)
+    return encoded, event, baseline
+
+
+def _regression_vif(fitted):
+    """
+    Variance inflation factors for each design-matrix column.
+
+    Reported per design column, so a categorical predictor contributes one row per dummy. Dummy
+    columns from the same multi-level factor inflate each other by construction, so a high VIF
+    there is expected and is not the same finding as two genuinely collinear predictors.
+    """
+    exog = np.asarray(fitted.model.exog, dtype=float)
+    names = list(fitted.model.exog_names)
+    rows = []
+    for index, name in enumerate(names):
+        if name == "Intercept":
+            continue
+        try:
+            value = variance_inflation_factor(exog, index)
+        except Exception:
+            value = float("nan")
+        rows.append({"term": name, "VIF": float(value)})
+    return pd.DataFrame(rows)
+
+
+def _regression_print_vif(vif_table, alpha_free_threshold=5.0):
+    """Print the VIF table and flag collinearity worth investigating."""
+    if vif_table.empty:
+        return None
+    print("Multicollinearity (variance inflation factors):")
+    for _, row in vif_table.iterrows():
+        value = row["VIF"]
+        display = "not estimable" if not np.isfinite(value) else f"{value:.2f}"
+        print(f"  {row['term']}: {display}")
+
+    finite = vif_table[np.isfinite(vif_table["VIF"])]
+    high = finite[finite["VIF"] >= alpha_free_threshold]
+    if not high.empty:
+        printColor(
+            f"Warning: VIF >= {alpha_free_threshold:.0f} for: "
+            f"{', '.join(high['term'].tolist())}. Coefficients and their standard errors for "
+            f"these terms are unstable. This is expected, and not a problem, when the terms are "
+            f"dummies of one multi-level categorical predictor, or an interaction or polynomial "
+            f"term and the components it is built from - they are collinear by construction. "
+            f"Between separate predictors it usually means they carry overlapping information.",
+            "yellow",
+        )
+    else:
+        print("  No VIF at or above the conventional threshold.")
+    print()
+    return high["term"].tolist() if not high.empty else []
+
+
+def _regression_sample_size_check(n, n_parameters, model, events=None):
+    """
+    Warn when the model is being asked to estimate more than the data can support.
+
+    Reported because reviewers of medical work routinely ask for it, and because an overfitted
+    model produces confident-looking coefficients that will not replicate.
+    """
+    n_predictors = max(n_parameters - 1, 1)  # exclude the intercept
+    if model == "logistic" and events is not None:
+        limiting = min(events, n - events)
+        epv = limiting / n_predictors
+        print(f"Events per variable (EPV): {epv:.1f} ({limiting} limiting events / {n_predictors} model term(s)).")
+        if epv < 10:
+            printColor(
+                f"Warning: EPV is below the conventional minimum of 10. Coefficients are likely "
+                f"biased away from the null and the confidence intervals are optimistic. Consider "
+                f"fewer predictors, or a penalised model.",
+                "yellow",
+            )
+        print()
+        return {"events_per_variable": float(epv), "limiting_events": int(limiting)}
+
+    ratio = n / n_predictors
+    print(f"Observations per model term: {ratio:.1f} ({n} observations / {n_predictors} term(s)).")
+    if ratio < 10:
+        printColor(
+            "Warning: fewer than 10 observations per model term. The model is at high risk of "
+            "overfitting, and the coefficients should be treated as exploratory.",
+            "yellow",
+        )
+    print()
+    return {"observations_per_term": float(ratio)}
+
+
+def _regression_linear_diagnostics(fitted, alpha, n):
+    """
+    Post-fit checks for a linear model. These are reported, never used to switch models.
+
+    The one exception is heteroscedasticity, which triggers a refit with HC3 robust standard
+    errors. That changes only the covariance estimator - the coefficients, and the model itself,
+    are identical - so it does not amount to choosing a different model behind the user's back.
+    """
+    diagnostics = {}
+    residuals = np.asarray(fitted.resid, dtype=float)
+
+    print_title("Model Diagnostics")
+
+    # --- Residual normality ---
+    if n <= 5000:
+        shapiro_statistic, shapiro_p = stats.shapiro(residuals)
+        diagnostics["residual_normality"] = {
+            "test": "Shapiro-Wilk",
+            "statistic": float(shapiro_statistic),
+            "p_value": float(shapiro_p),
+            "normal": bool(shapiro_p > alpha),
+        }
+        print("Residual normality (Shapiro-Wilk on the residuals):")
+        print(f"  Statistic: {round(float(shapiro_statistic), 3)}")
+        print(f"  p-value: {_display_p_value(shapiro_p)}")
+        if shapiro_p > alpha:
+            print("  Residuals are consistent with normality.")
+        else:
+            printColor(
+                "  Residuals are not normally distributed. The coefficients remain unbiased, but "
+                "small-sample p-values and confidence intervals may be inaccurate. With a large "
+                "n this matters little; with a small n, or with visible skew or outliers in the "
+                "residual plots, consider transforming the outcome.",
+                "yellow",
+            )
+    else:
+        diagnostics["residual_normality"] = {
+            "test": "skipped", "reason": "n > 5000", "normal": None,
+        }
+        print("Residual normality: skipped (n > 5000; Shapiro-Wilk is unreliable at this size).")
+    print()
+
+    # --- Homoscedasticity ---
+    robust = False
+    try:
+        bp_statistic, bp_p, _, _ = het_breuschpagan(residuals, fitted.model.exog)
+        diagnostics["homoscedasticity"] = {
+            "test": "Breusch-Pagan",
+            "statistic": float(bp_statistic),
+            "p_value": float(bp_p),
+            "constant_variance": bool(bp_p > alpha),
+        }
+        print("Homoscedasticity (Breusch-Pagan):")
+        print(f"  Statistic: {round(float(bp_statistic), 3)}")
+        print(f"  p-value: {_display_p_value(bp_p)}")
+        if bp_p > alpha:
+            print("  Residual variance is consistent with being constant.")
+        else:
+            robust = True
+            printColor(
+                "  Residual variance is not constant (heteroscedasticity). Refitting with HC3 "
+                "robust standard errors. The coefficients are unchanged; only their standard "
+                "errors, p-values and confidence intervals are corrected.",
+                "yellow",
+            )
+    except Exception as error:
+        diagnostics["homoscedasticity"] = {"test": "failed", "reason": str(error)}
+        print(f"Homoscedasticity: could not be tested ({error}).")
+    print()
+
+    # --- Linearity ---
+    try:
+        reset = linear_reset(fitted, power=2, test_type="fitted", use_f=True)
+        reset_p = float(reset.pvalue)
+        diagnostics["linearity"] = {
+            "test": "Ramsey RESET (squared fitted values)",
+            "p_value": reset_p,
+            "linear": bool(reset_p > alpha),
+        }
+        print("Linearity (Ramsey RESET):")
+        print(f"  p-value: {_display_p_value(reset_p)}")
+        if reset_p > alpha:
+            print("  No evidence of a missing non-linear term.")
+        else:
+            printColor(
+                "  Evidence that the relationship is not purely linear. Consider adding a "
+                "quadratic or spline term, or transforming a predictor, using the formula "
+                "argument. Check the residuals-vs-fitted plot to see which predictor is "
+                "responsible.",
+                "yellow",
+            )
+    except Exception as error:
+        diagnostics["linearity"] = {"test": "failed", "reason": str(error)}
+        print(f"Linearity: could not be tested ({error}).")
+    print()
+
+    # --- Influential observations ---
+    try:
+        influence = OLSInfluence(fitted)
+        cooks = np.asarray(influence.cooks_distance[0], dtype=float)
+        threshold = 4.0 / n
+        flagged = int(np.sum(cooks > threshold))
+        diagnostics["influence"] = {
+            "measure": "Cook's distance",
+            "threshold": float(threshold),
+            "n_flagged": flagged,
+            "max": float(np.nanmax(cooks)) if cooks.size else float("nan"),
+        }
+        print("Influential observations (Cook's distance):")
+        print(f"  Threshold (4/n): {threshold:.4f}")
+        print(f"  Largest Cook's distance: {np.nanmax(cooks):.4f}")
+        print(f"  Observations above the threshold: {flagged} of {n}")
+        if flagged > 0:
+            printColor(
+                f"  {flagged} observation(s) exert disproportionate influence on the fit. Check "
+                f"them for data-entry errors. Do not delete them merely because they are "
+                f"influential - a genuine extreme value is information, not noise.",
+                "yellow",
+            )
+        diagnostics["influence"]["cooks_distance"] = cooks
+    except Exception as error:
+        diagnostics["influence"] = {"measure": "failed", "reason": str(error)}
+        print(f"Influential observations: could not be assessed ({error}).")
+    print()
+
+    # --- Independence of residuals ---
+    durbin_watson_value = float(sm.stats.durbin_watson(residuals))
+    diagnostics["durbin_watson"] = durbin_watson_value
+    print(f"Independence of residuals (Durbin-Watson): {durbin_watson_value:.3f}")
+    print(
+        "  Values near 2 indicate no first-order autocorrelation. This only matters when the "
+        "rows have a meaningful order, such as a time series or repeated measures."
+    )
+    print()
+
+    return diagnostics, robust
+
+
+def _regression_auc(y_true, probabilities):
+    """
+    Concordance statistic (area under the ROC curve).
+
+    Computed from the Mann-Whitney U statistic, which is exactly equivalent to the AUC and keeps
+    this function free of any dependency the package does not already declare.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    probabilities = np.asarray(probabilities, dtype=float)
+    positives = probabilities[y_true == 1]
+    negatives = probabilities[y_true == 0]
+    if positives.size == 0 or negatives.size == 0:
+        return float("nan")
+    statistic = stats.mannwhitneyu(positives, negatives, alternative="two-sided").statistic
+    return float(statistic / (positives.size * negatives.size))
+
+
+def _regression_hosmer_lemeshow(y_true, probabilities, groups=10):
+    """
+    Hosmer-Lemeshow calibration test.
+
+    A large p-value means no evidence of poor calibration, so - unusually - a non-significant
+    result is the reassuring one here. The test is known to be sensitive to the number of groups,
+    so the group count actually used is reported alongside it.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    probabilities = np.asarray(probabilities, dtype=float)
+    n = y_true.size
+
+    order = np.argsort(probabilities)
+    y_sorted = y_true[order]
+    p_sorted = probabilities[order]
+
+    groups = int(min(groups, max(2, n // 5)))
+    edges = np.array_split(np.arange(n), groups)
+    edges = [chunk for chunk in edges if chunk.size > 0]
+    groups = len(edges)
+    if groups < 3:
+        return None
+
+    statistic = 0.0
+    table = []
+    for chunk in edges:
+        observed = float(y_sorted[chunk].sum())
+        expected = float(p_sorted[chunk].sum())
+        size = float(chunk.size)
+        table.append(
+            {
+                "n": int(size),
+                "observed_events": observed,
+                "expected_events": expected,
+                "mean_predicted": float(p_sorted[chunk].mean()),
+                "observed_rate": observed / size,
+            }
+        )
+        denominator = expected * (1.0 - expected / size)
+        if denominator <= 0:
+            continue
+        statistic += (observed - expected) ** 2 / denominator
+
+    degrees_of_freedom = groups - 2
+    if degrees_of_freedom < 1:
+        return None
+    p_value = float(stats.chi2.sf(statistic, degrees_of_freedom))
+    return {
+        "test": "Hosmer-Lemeshow",
+        "statistic": float(statistic),
+        "degrees_of_freedom": int(degrees_of_freedom),
+        "p_value": p_value,
+        "groups": groups,
+        "table": pd.DataFrame(table),
+    }
+
+
+def _regression_logistic_diagnostics(fitted, y_true, alpha, n):
+    """Post-fit checks for a logistic model. Reported, never used to switch models."""
+    diagnostics = {}
+    probabilities = np.asarray(fitted.predict(), dtype=float)
+
+    print_title("Model Diagnostics")
+
+    # --- Separation ---
+    extreme = int(np.sum((probabilities > 0.999) | (probabilities < 0.001)))
+    standard_errors = np.asarray(fitted.bse, dtype=float)
+    huge_se = int(np.sum(standard_errors > 25))
+    separated = extreme > 0 and huge_se > 0
+    diagnostics["separation"] = {
+        "extreme_fitted_probabilities": extreme,
+        "very_large_standard_errors": huge_se,
+        "suspected": bool(separated),
+    }
+    print("Separation check:")
+    print(f"  Fitted probabilities within 0.001 of 0 or 1: {extreme} of {n}")
+    print(f"  Coefficients with a standard error above 25: {huge_se}")
+    if separated:
+        printColor(
+            "  Complete or quasi-complete separation is likely: some combination of predictors "
+            "perfectly predicts the outcome. The affected coefficients and their confidence "
+            "intervals are not trustworthy at any size. Consider merging sparse categories, "
+            "dropping the offending predictor, or a penalised (Firth) logistic model.",
+            "yellow",
+        )
+    else:
+        print("  No sign of separation.")
+    print()
+
+    # --- Discrimination ---
+    auc = _regression_auc(y_true, probabilities)
+    diagnostics["auc"] = auc
+    print(f"Discrimination (c-statistic / AUC): {auc:.3f}")
+    if np.isfinite(auc):
+        if auc < 0.6:
+            quality = "poor - barely better than chance"
+        elif auc < 0.7:
+            quality = "weak"
+        elif auc < 0.8:
+            quality = "acceptable"
+        elif auc < 0.9:
+            quality = "good"
+        else:
+            quality = "excellent, but check for overfitting or a predictor that encodes the outcome"
+        print(f"  Interpretation: {quality}.")
+    print(
+        "  This is apparent discrimination, measured on the same data the model was fitted to, "
+        "so it is optimistic. Honest estimates need cross-validation or an external sample."
+    )
+    print()
+
+    # --- Calibration ---
+    hosmer = _regression_hosmer_lemeshow(y_true, probabilities)
+    if hosmer is None:
+        diagnostics["calibration"] = {"test": "skipped", "reason": "too few observations"}
+        print("Calibration (Hosmer-Lemeshow): skipped (too few observations to form groups).")
+    else:
+        diagnostics["calibration"] = hosmer
+        print(f"Calibration (Hosmer-Lemeshow, {hosmer['groups']} groups):")
+        print(f"  Statistic: {round(hosmer['statistic'], 3)} on {hosmer['degrees_of_freedom']} df")
+        print(f"  p-value: {_display_p_value(hosmer['p_value'])}")
+        if hosmer["p_value"] > alpha:
+            print(
+                "  No evidence of poor calibration. Note that a non-significant result is the "
+                "reassuring one for this test, which is the opposite of the usual reading."
+            )
+        else:
+            printColor(
+                "  Evidence of poor calibration: predicted probabilities do not match observed "
+                "event rates across the risk range. The model may still rank patients well "
+                "(see the c-statistic), but the probabilities it produces should not be quoted "
+                "as absolute risks.",
+                "yellow",
+            )
+    print()
+
+    return diagnostics
+
+
+def _regression_pretty_term(term):
+    """
+    Turn a patsy design-matrix name into something a reader can follow.
+
+    C(Q('smoking'), Treatment(reference='never'))[T.current]  ->  smoking [current vs never]
+    """
+
+    categorical = re.match(
+        r"^C\(\s*(?:Q\(['\"](?P<quoted>.+?)['\"]\)|(?P<plain>[^,\)]+?))\s*,\s*"
+        r"Treatment\(reference=['\"](?P<reference>.*?)['\"]\)\s*\)\[T\.(?P<level>.+)\]$",
+        term,
+    )
+    if categorical:
+        name = categorical.group("quoted") or categorical.group("plain")
+        return f"{name.strip()} [{categorical.group('level')} vs {categorical.group('reference')}]"
+
+    quoted = re.match(r"^Q\(['\"](.+?)['\"]\)$", term)
+    if quoted:
+        return quoted.group(1)
+
+    # Fall back to stripping Q('...') wrappers inside a larger expression (interactions, etc.)
+    return re.sub(r"Q\(['\"](.+?)['\"]\)", r"\1", term)
+
+
+def _regression_tidy(fitted, model, alpha):
+    """Build the per-term results table, on the coefficient scale and the reported scale."""
+    # A results object from get_robustcov_results() returns plain arrays rather than the indexed
+    # Series a normal fit gives back, so read the term names off the design matrix and coerce
+    # everything to arrays. That keeps this function correct for both the plain and robust fits.
+    names = list(fitted.model.exog_names)
+    confidence = np.asarray(fitted.conf_int(alpha=alpha), dtype=float)
+
+    table = pd.DataFrame(
+        {
+            "term": [_regression_pretty_term(name) for name in names],
+            "design_term": names,
+            "coefficient": np.asarray(fitted.params, dtype=float),
+            "std_error": np.asarray(fitted.bse, dtype=float),
+            "statistic": np.asarray(fitted.tvalues, dtype=float),
+            "p_value": np.asarray(fitted.pvalues, dtype=float),
+            "ci_lower": confidence[:, 0],
+            "ci_upper": confidence[:, 1],
+        }
+    )
+
+    if model == "logistic":
+        table["odds_ratio"] = np.exp(table["coefficient"])
+        table["or_ci_lower"] = np.exp(table["ci_lower"])
+        table["or_ci_upper"] = np.exp(table["ci_upper"])
+
+    return table.reset_index(drop=True)
+
+
+def _regression_print_coefficients(table, model, alpha, robust):
+    """Print the coefficient table in the reported scale, with the null value made explicit."""
+    confidence_level = round(100 - (alpha * 100), 10)
+    if confidence_level == int(confidence_level):
+        confidence_level = int(confidence_level)
+
+    print_title("Model Coefficients")
+
+    if model == "logistic":
+        print(f"Effects are odds ratios with {confidence_level}% confidence intervals (null value = 1).")
+        print()
+        header = f"{'Term':<38}{'OR':>10}{'  ' + str(confidence_level) + '% CI':>22}{'p':>12}"
+    else:
+        scale = "robust (HC3)" if robust else "model-based"
+        print(
+            f"Effects are unstandardised coefficients with {confidence_level}% confidence "
+            f"intervals (null value = 0), using {scale} standard errors."
+        )
+        print()
+        header = f"{'Term':<38}{'Coef':>10}{'  ' + str(confidence_level) + '% CI':>22}{'p':>12}"
+
+    print(header)
+    print("-" * len(header))
+
+    for _, row in table.iterrows():
+        if model == "logistic":
+            estimate = row["odds_ratio"]
+            lower, upper = row["or_ci_lower"], row["or_ci_upper"]
+        else:
+            estimate = row["coefficient"]
+            lower, upper = row["ci_lower"], row["ci_upper"]
+
+        label = str(row["term"])
+        if len(label) > 36:
+            label = label[:35] + "…"
+        interval = f"[{lower:.3f}, {upper:.3f}]"
+        print(f"{label:<38}{estimate:>10.3f}{interval:>24}{str(_display_p_value(row['p_value'])):>12}")
+
+    print()
+
+    predictors = table[table["design_term"] != "Intercept"]
+    significant = predictors[predictors["p_value"] < alpha]
+    if significant.empty:
+        printColor("No predictor is significantly associated with the outcome.", "red")
+    else:
+        printColor(
+            f"Significantly associated with the outcome: {', '.join(significant['term'].tolist())}.",
+            "green",
+        )
+    print()
+
+
+def _regression_print_fit(fitted, model, y_true=None):
+    """Print overall model fit, kept separate from the per-term effects."""
+    print_title("Model Fit")
+    summary = {"aic": float(fitted.aic), "bic": float(fitted.bic), "n": int(fitted.nobs)}
+
+    if model == "linear":
+        summary["r_squared"] = float(fitted.rsquared)
+        summary["adj_r_squared"] = float(fitted.rsquared_adj)
+        summary["f_p_value"] = float(fitted.f_pvalue)
+        print(f"R-squared: {fitted.rsquared:.3f}")
+        print(f"Adjusted R-squared: {fitted.rsquared_adj:.3f}")
+        print(f"Overall model F-test p-value: {_display_p_value(fitted.f_pvalue)}")
+        print(
+            f"  The model explains {fitted.rsquared * 100:.1f}% of the variance in the outcome "
+            f"within this sample."
+        )
+    else:
+        summary["pseudo_r_squared"] = float(fitted.prsquared)
+        summary["lr_p_value"] = float(fitted.llr_pvalue)
+        print(f"McFadden pseudo R-squared: {fitted.prsquared:.3f}")
+        print(f"Likelihood-ratio test p-value: {_display_p_value(fitted.llr_pvalue)}")
+        print(
+            "  Pseudo R-squared values are not comparable to a linear model's R-squared and are "
+            "typically much lower; use it to compare models on the same data, not as a share of "
+            "variance explained."
+        )
+
+    print(f"AIC: {fitted.aic:.2f}    BIC: {fitted.bic:.2f}")
+    print()
+    return summary
+
+
+def _plot_regression_diagnostics(fitted, model, y_true, cooks_distance, do_graphs):
+    """Diagnostic plots: residual behaviour for a linear model, discrimination and calibration for logistic."""
+    if not do_graphs:
+        return
+
+    if model == "linear":
+        fitted_values = np.asarray(fitted.fittedvalues, dtype=float)
+        residuals = np.asarray(fitted.resid, dtype=float)
+
+        figure, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+        axes[0].scatter(fitted_values, residuals, alpha=0.6, edgecolor="none")
+        axes[0].axhline(0, linestyle="--", linewidth=1, color="grey")
+        axes[0].set_xlabel("Fitted values")
+        axes[0].set_ylabel("Residuals")
+        axes[0].set_title("Residuals vs fitted\n(look for curvature or a funnel shape)")
+
+        stats.probplot(residuals, dist="norm", plot=axes[1])
+        axes[1].set_title("Normal Q-Q of residuals\n(points should follow the line)")
+
+        if cooks_distance is not None and len(cooks_distance):
+            threshold = 4.0 / len(cooks_distance)
+            axes[2].vlines(np.arange(len(cooks_distance)), 0, cooks_distance, linewidth=1)
+            axes[2].axhline(threshold, linestyle="--", linewidth=1, color="red")
+            axes[2].set_xlabel("Observation")
+            axes[2].set_ylabel("Cook's distance")
+            axes[2].set_title("Influence\n(red line = 4/n threshold)")
+        else:
+            axes[2].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+        print()
+        return
+
+    # --- Logistic: ROC and calibration ---
+    probabilities = np.asarray(fitted.predict(), dtype=float)
+    y_true = np.asarray(y_true, dtype=float)
+
+    figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    order = np.argsort(-probabilities)
+    labels = y_true[order]
+    positives = labels.sum()
+    negatives = labels.size - positives
+    if positives > 0 and negatives > 0:
+        true_positive_rate = np.concatenate([[0.0], np.cumsum(labels) / positives])
+        false_positive_rate = np.concatenate([[0.0], np.cumsum(1 - labels) / negatives])
+        auc = _regression_auc(y_true, probabilities)
+        axes[0].plot(false_positive_rate, true_positive_rate, linewidth=2)
+        axes[0].plot([0, 1], [0, 1], linestyle="--", linewidth=1, color="grey")
+        axes[0].set_xlabel("False positive rate (1 - specificity)")
+        axes[0].set_ylabel("True positive rate (sensitivity)")
+        axes[0].set_title(f"ROC curve (AUC = {auc:.3f})")
+    else:
+        axes[0].axis("off")
+
+    hosmer = _regression_hosmer_lemeshow(y_true, probabilities)
+    if hosmer is not None:
+        groups = hosmer["table"]
+        axes[1].plot([0, 1], [0, 1], linestyle="--", linewidth=1, color="grey")
+        axes[1].plot(groups["mean_predicted"], groups["observed_rate"], marker="o", linewidth=1.5)
+        axes[1].set_xlabel("Mean predicted probability")
+        axes[1].set_ylabel("Observed event rate")
+        axes[1].set_title("Calibration by risk group\n(points should follow the line)")
+    else:
+        axes[1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    print()
+
+
+def _regression_detect_separation(data, outcome, predictors):
+    """
+    Look for separation before fitting, rather than inferring it from how the fit failed.
+
+    statsmodels only sometimes warns about separation - in other cases it fails with a bare
+    "Singular matrix" that is indistinguishable from ordinary collinearity. Since separation is
+    the most common reason a logistic model fails on a small clinical dataset, and since the
+    remedy is completely different, it is worth checking directly.
+
+    Returns a list of human-readable descriptions, empty when nothing is found.
+    """
+    findings = []
+    y = np.asarray(data[outcome], dtype=float)
+    if np.unique(y).size < 2:
+        return findings
+
+    for name in predictors:
+        series = data[name]
+        is_factor = (
+            isinstance(series.dtype, pd.CategoricalDtype)
+            or series.dtype == object
+            or series.dtype == bool
+            or series.nunique() <= 10
+        )
+        if is_factor:
+            for level, group in data.groupby(series, observed=True)[outcome]:
+                rate = float(np.mean(np.asarray(group, dtype=float)))
+                if rate in (0.0, 1.0):
+                    outcome_word = "never" if rate == 0.0 else "always"
+                    findings.append(
+                        f'"{name}" = {level} ({len(group)} observation(s)): the event {outcome_word} '
+                        f"occurs in this group"
+                    )
+        else:
+            values = np.asarray(series, dtype=float)
+            zeros, ones = values[y == 0], values[y == 1]
+            if zeros.size and ones.size:
+                if zeros.max() < ones.min() or ones.max() < zeros.min():
+                    findings.append(
+                        f'"{name}": a single cut-point on this variable separates the two outcome '
+                        f"groups perfectly"
+                    )
+    return findings
+
+
+_REGRESSION_SEPARATION_MESSAGE = (
+    "The logistic model could not be fitted because of complete or quasi-complete separation: "
+    "some combination of predictors perfectly predicts the outcome, so the maximum-likelihood "
+    "estimate does not exist. Merge sparse categories, remove the offending predictor, or use a "
+    "penalised (Firth) logistic model."
+)
+
+
+def _regression_fit(formula, data, model, separation_hint=False):
+    """
+    Fit the chosen model, translating the common failure modes into readable messages.
+
+    Warnings are captured rather than silenced: statsmodels signals separation with a warning and
+    only then fails with a bare "Singular matrix", so discarding the warnings would leave us
+    unable to tell separation (a data problem with a specific remedy) apart from exact
+    collinearity (a different problem with a different remedy).
+
+    Returns:
+        tuple: (fitted results, list of note strings worth reporting to the user)
+    """
+    notes = []
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            if model == "linear":
+                fitted = smf.ols(formula, data=data).fit()
+            else:
+                fitted = smf.logit(formula, data=data).fit(disp=0)
+
+        categories = {type(item.message).__name__ for item in caught}
+        messages = " ".join(str(item.message) for item in caught)
+        if any("PerfectSeparation" in name for name in categories):
+            notes.append(
+                "statsmodels reported perfect separation while fitting: at least one coefficient "
+                "is not identifiable, and its estimate and confidence interval are meaningless "
+                "however large they look."
+            )
+        if any("Convergence" in name for name in categories) or "did not converge" in messages:
+            notes.append(
+                "The fitting algorithm did not converge. The reported estimates are wherever the "
+                "optimiser stopped, not the maximum-likelihood solution, and should not be used."
+            )
+        return fitted, notes
+
+    except PerfectSeparationError:
+        raise Exception(_REGRESSION_SEPARATION_MESSAGE)
+    except np.linalg.LinAlgError:
+        # A singular matrix here has two very different causes. Separation announces itself with
+        # a warning first, so use that to decide which remedy to recommend.
+        separated = separation_hint or any(
+            "PerfectSeparation" in type(item.message).__name__
+            or "eparation" in str(item.message)
+            for item in caught
+        )
+        if model == "logistic" and separated:
+            raise Exception(_REGRESSION_SEPARATION_MESSAGE)
+        raise Exception(
+            "The model could not be fitted because the design matrix is singular. This usually "
+            "means two predictors are perfectly collinear (one is an exact combination of the "
+            "others, such as a total and all of its parts). Remove the redundant predictor and "
+            "refit."
+            + (
+                " In a logistic model it can also mean separation, so check whether any predictor "
+                "perfectly predicts the outcome."
+                if model == "logistic"
+                else ""
+            )
+        )
+
+
+def _regression_univariable(data, outcome, predictors, model, alpha, reference, categorical_limit):
+    """
+    Fit each predictor on its own, for the crude-vs-adjusted table used in medical papers.
+
+    This is descriptive only. It must not be used to decide which predictors enter the
+    multivariable model: choosing predictors by their univariable p-value is a form of stepwise
+    selection, and it invalidates the p-values and confidence intervals that get reported.
+    """
+    rows = []
+    for name in predictors:
+        formula, _ = _regression_build_formula(
+            outcome, [name], data, reference, categorical_limit
+        )
+        try:
+            fitted, _ = _regression_fit(formula, data, model)
+        except Exception as error:
+            printColor(f'Univariable model for "{name}" could not be fitted: {error}', "yellow")
+            continue
+        table = _regression_tidy(fitted, model, alpha)
+        rows.append(table[table["design_term"] != "Intercept"])
+
+    if not rows:
+        return None
+    return pd.concat(rows, ignore_index=True)
+
+
+def _regression_print_univariable(crude, adjusted, model, alpha):
+    """Print crude and adjusted effects side by side."""
+    confidence_level = round(100 - (alpha * 100), 10)
+    if confidence_level == int(confidence_level):
+        confidence_level = int(confidence_level)
+
+    print_title("Univariable (Crude) vs Multivariable (Adjusted)")
+    print(
+        "Crude effects come from one model per predictor; adjusted effects come from the single "
+        "model containing all of them. A large gap between the two means the other predictors "
+        "are carrying part of the association."
+    )
+    printColor(
+        "This table is descriptive. Do not use the crude p-values to decide which predictors to "
+        "keep - selecting predictors from the data invalidates the confidence intervals and "
+        "p-values of the final model.",
+        "yellow",
+    )
+    print()
+
+    scale = "OR" if model == "logistic" else "Coef"
+    header = f"{'Term':<34}{'Crude ' + scale:>12}{'  crude CI':>22}{'Adj. ' + scale:>12}{'  adjusted CI':>22}"
+    print(header)
+    print("-" * len(header))
+
+    adjusted_by_term = {row["design_term"]: row for _, row in adjusted.iterrows()}
+    for _, row in crude.iterrows():
+        label = str(row["term"])
+        if len(label) > 32:
+            label = label[:31] + "…"
+
+        if model == "logistic":
+            crude_estimate = row["odds_ratio"]
+            crude_interval = f"[{row['or_ci_lower']:.3f}, {row['or_ci_upper']:.3f}]"
+        else:
+            crude_estimate = row["coefficient"]
+            crude_interval = f"[{row['ci_lower']:.3f}, {row['ci_upper']:.3f}]"
+
+        match = adjusted_by_term.get(row["design_term"])
+        if match is None:
+            adjusted_estimate, adjusted_interval = float("nan"), "-"
+        elif model == "logistic":
+            adjusted_estimate = match["odds_ratio"]
+            adjusted_interval = f"[{match['or_ci_lower']:.3f}, {match['or_ci_upper']:.3f}]"
+        else:
+            adjusted_estimate = match["coefficient"]
+            adjusted_interval = f"[{match['ci_lower']:.3f}, {match['ci_upper']:.3f}]"
+
+        print(
+            f"{label:<34}{crude_estimate:>12.3f}{crude_interval:>24}"
+            f"{adjusted_estimate:>12.3f}{adjusted_interval:>24}"
+        )
+    print()
+
+
+def regress(
+    data,
+    outcome=None,
+    predictors=None,
+    formula=None,
+    alpha=0.05,
+    outcome_type=None,
+    force_model=None,
+    reference=None,
+    outcome_positive=None,
+    univariable=False,
+    do_graphs=True,
+    categorical_limit=20,
+):
+    """
+    Automatically selects and fits the appropriate regression model, then reports diagnostics.
+
+    The model family is chosen from the outcome variable before fitting. Assumption checks run
+    after the fit and are reported, not used to silently substitute a different model - there is
+    no single agreed-upon fallback when a regression assumption fails, and the right response
+    usually depends on why it failed. The one automatic change is a switch to HC3 robust standard
+    errors under heteroscedasticity, which leaves the coefficients and the model untouched.
+
+    Parameters:
+        data (pd.DataFrame): DataFrame containing the data.
+        outcome (str): Name of the outcome (dependent) column. Required unless formula is given.
+        predictors (list of str): Names of the predictor (independent) columns. Required unless
+            formula is given. A single string is accepted for a one-predictor model.
+        formula (str, optional): A patsy formula such as "bp ~ age * sex + np.log(bmi)". Use this
+            for interactions, transformations and polynomial terms. Overrides predictors.
+        alpha (float): Significance level; confidence intervals are reported at 100(1-alpha)%.
+            Default is 0.05.
+        outcome_type (str, optional): 'cont' or 'cat'. If not provided, the function infers a type
+            from the outcome and prints a yellow warning.
+        force_model (str, optional): 'linear' or 'logistic'. Skips outcome inspection entirely.
+        reference (dict, optional): Baseline level per categorical predictor, e.g.
+            {'smoking': 'never'}. Defaults to the first level in sort order, which is printed.
+        outcome_positive (optional): Which outcome level is modelled as the event in a logistic
+            model. Defaults to the higher of the two levels, which is printed.
+        univariable (bool): If True, also fit one model per predictor and print a crude-vs-adjusted
+            table. Descriptive only - it is not a predictor selection procedure. Default is False.
+        do_graphs (bool): Whether to draw diagnostic plots. Default is True.
+        categorical_limit (int): Unique-value threshold used only when outcome_type is not set.
+            Default is 20.
+
+    Returns:
+        dict: model kind, formula, sample size, the coefficient table (a tidy DataFrame ready for
+        a manuscript table), overall fit, diagnostics, the reference levels used, and the fitted
+        statsmodels object under "fitted_model" for any follow-up work.
+    """
+    if not isinstance(data, pd.DataFrame):
+        raise Exception("data must be a pandas DataFrame.")
+
+    # --- Resolve the two input styles into an outcome plus a set of columns to use ---
+    if formula is not None:
+        outcome = _regression_formula_outcome(formula, data)
+        if outcome is None:
+            raise Exception(
+                "The left-hand side of the formula must be a plain column name (optionally "
+                "quoted as Q('name')). Transformed outcomes such as np.log(y) are not supported "
+                "yet - create the transformed column first, then use it as the outcome."
+            )
+        used_columns = _regression_formula_columns(formula, data)
+        if outcome not in used_columns:
+            used_columns.append(outcome)
+        predictors = [column for column in used_columns if column != outcome]
+    else:
+        if outcome is None or predictors is None:
+            raise Exception(
+                "Provide either outcome and predictors, or a formula. For example: "
+                "regress(df, outcome='bp', predictors=['age', 'sex'])."
+            )
+        if isinstance(predictors, str):
+            predictors = [predictors]
+        predictors = list(predictors)
+        if not predictors:
+            raise Exception("predictors is empty - a regression model needs at least one predictor.")
+        used_columns = [outcome] + predictors
+
+    missing_columns = [column for column in used_columns if column not in data.columns]
+    if missing_columns:
+        raise Exception(
+            f"Column(s) not found in the data: {', '.join(map(str, missing_columns))}."
+        )
+    if outcome in predictors:
+        raise Exception(
+            f'"{outcome}" is both the outcome and a predictor. A model cannot explain a variable '
+            f"with itself."
+        )
+
+    print_title("Regression")
+    print("alpha is set to", alpha)
+    print()
+
+    # --- Complete-case analysis, reported in the same style as the comparison functions ---
+    total_rows = len(data)
+    data_clean = data.dropna(subset=used_columns).copy()
+    dropped = total_rows - len(data_clean)
+    if dropped > 0:
+        print(
+            f"Dropping {dropped} row(s) with missing values in the model variables "
+            f"({len(data_clean)} of {total_rows} remain)."
+        )
+        printColor(
+            "Complete-case analysis assumes the missing values are missing at random. If they "
+            "are not, the estimates are biased and no diagnostic below will reveal it.",
+            "yellow",
+        )
+    else:
+        print("No missing values in the model variables to drop.")
+    print()
+
+    if len(data_clean) < 10:
+        printColor(
+            f"Cannot fit a regression model: only {len(data_clean)} complete observation(s) "
+            f"remain.",
+            "yellow",
+        )
+        return None
+
+    # --- Guards on the variables themselves ---
+    if data_clean[outcome].nunique() < 2:
+        printColor(
+            f'Cannot fit a model: the outcome "{outcome}" is constant after dropping missing '
+            f"values, so there is nothing to explain.",
+            "yellow",
+        )
+        return None
+
+    constant_predictors = [name for name in predictors if data_clean[name].nunique() < 2]
+    if constant_predictors:
+        printColor(
+            f"Dropping constant predictor(s) with no variance to explain anything: "
+            f"{', '.join(map(str, constant_predictors))}.",
+            "yellow",
+        )
+        if formula is not None:
+            raise Exception(
+                "A predictor in the formula is constant after dropping missing values. Remove it "
+                "from the formula and refit."
+            )
+        predictors = [name for name in predictors if name not in constant_predictors]
+        if not predictors:
+            printColor("No predictors with variance remain; cannot fit a model.", "yellow")
+            return None
+
+    # --- Choose the model family from the outcome ---
+    model = _regression_select_model(
+        data_clean[outcome], outcome, outcome_type, force_model, categorical_limit, alpha
+    )
+
+    event_level = None
+    baseline_level = None
+    if model == "logistic":
+        encoded, event_level, baseline_level = _regression_encode_binary_outcome(
+            data_clean, outcome, outcome_positive
+        )
+        data_clean[outcome] = encoded
+        printColor(
+            f'Modelling P("{outcome}" = {event_level}). Odds ratios above 1 mean higher odds of '
+            f'"{event_level}" rather than "{baseline_level}".',
+            "cyan",
+        )
+    print()
+
+    # --- Build the design and fit ---
+    if formula is not None:
+        model_formula = formula
+        reference_levels = {}
+        print(f"Using the supplied formula: {model_formula}")
+    else:
+        model_formula, reference_levels = _regression_build_formula(
+            outcome, predictors, data_clean, reference, categorical_limit
+        )
+        if reference_levels:
+            print("Categorical predictors and their reference (baseline) levels:")
+            for name, detail in reference_levels.items():
+                others = [level for level in detail["levels"] if level != detail["reference"]]
+                print(
+                    f'  {name}: reference = "{detail["reference"]}"; '
+                    f"compared against {', '.join(map(str, others))}"
+                )
+            print("  Every effect for these predictors is relative to its reference level.")
+            print()
+
+    separation_findings = []
+    if model == "logistic":
+        separation_findings = _regression_detect_separation(data_clean, outcome, predictors)
+        if separation_findings:
+            printColor(
+                "Warning: separation detected before fitting. A predictor (or a level of one) "
+                "predicts the outcome perfectly, so the affected coefficient has no finite "
+                "maximum-likelihood estimate:",
+                "yellow",
+            )
+            for finding in separation_findings:
+                printColor(f"  - {finding}", "yellow")
+            printColor(
+                "  Any odds ratio and confidence interval for the affected term is meaningless, "
+                "however large it looks. Merge sparse categories, drop the predictor, or use a "
+                "penalised (Firth) logistic model.",
+                "yellow",
+            )
+            print()
+
+    fitted, fit_notes = _regression_fit(
+        model_formula, data_clean, model, separation_hint=bool(separation_findings)
+    )
+    n = int(fitted.nobs)
+    for note in fit_notes:
+        printColor(f"Warning: {note}", "yellow")
+    if fit_notes:
+        print()
+
+    print_title("Model Adequacy")
+    events = int(np.asarray(data_clean[outcome], dtype=float).sum()) if model == "logistic" else None
+    size_check = _regression_sample_size_check(n, len(fitted.params), model, events=events)
+    vif_table = _regression_vif(fitted)
+    _regression_print_vif(vif_table)
+
+    # --- Post-fit diagnostics (reported, not re-dispatched) ---
+    robust = False
+    cooks_distance = None
+    if model == "linear":
+        diagnostics, needs_robust = _regression_linear_diagnostics(fitted, alpha, n)
+        cooks_distance = diagnostics.get("influence", {}).get("cooks_distance")
+        if needs_robust:
+            fitted = fitted.get_robustcov_results(cov_type="HC3")
+            robust = True
+    else:
+        y_true = np.asarray(data_clean[outcome], dtype=float)
+        diagnostics = _regression_logistic_diagnostics(fitted, y_true, alpha, n)
+
+    diagnostics["multicollinearity"] = vif_table
+    diagnostics["sample_size"] = size_check
+    if model == "logistic":
+        diagnostics["separation"]["pre_fit_findings"] = separation_findings
+
+    # --- Report ---
+    fit_summary = _regression_print_fit(fitted, model)
+    coefficients = _regression_tidy(fitted, model, alpha)
+    _regression_print_coefficients(coefficients, model, alpha, robust)
+
+    crude = None
+    if univariable:
+        if formula is not None:
+            printColor(
+                "univariable=True is ignored when a formula is supplied, because an arbitrary "
+                "formula cannot be reliably split into single-predictor models. Use the "
+                "predictors argument instead.",
+                "yellow",
+            )
+        else:
+            crude = _regression_univariable(
+                data_clean, outcome, predictors, model, alpha, reference, categorical_limit
+            )
+            if crude is not None:
+                _regression_print_univariable(crude, coefficients, model, alpha)
+
+    _plot_regression_diagnostics(
+        fitted,
+        model,
+        np.asarray(data_clean[outcome], dtype=float) if model == "logistic" else None,
+        cooks_distance,
+        do_graphs,
+    )
+
+    return {
+        "model": model,
+        "formula": model_formula,
+        "n": n,
+        "n_dropped": int(dropped),
+        "alpha": alpha,
+        "coefficients": coefficients,
+        "univariable": crude,
+        "fit": fit_summary,
+        "diagnostics": diagnostics,
+        "robust_standard_errors": robust,
+        "reference_levels": reference_levels,
+        "outcome": outcome,
+        "outcome_positive": event_level,
+        "outcome_baseline": baseline_level,
+        "fitted_model": fitted,
+    }
